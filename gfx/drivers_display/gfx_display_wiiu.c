@@ -13,7 +13,6 @@
  *  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <wiiu/gx2.h>
 #include <retro_miscellaneous.h>
 
 #ifdef HAVE_CONFIG_H
@@ -248,7 +247,7 @@ static void gfx_display_wiiu_draw_pipeline(
 
    if (!wiiu->menu_shader_ubo)
    {
-      wiiu->menu_shader_ubo = MEM2_alloc(sizeof(*wiiu->menu_shader_ubo), GX2_UNIFORM_BLOCK_ALIGNMENT);
+      wiiu->menu_shader_ubo = MEM2_alloc(sizeof(*wiiu->menu_shader_ubo), GX2_SHADER_PROGRAM_ALIGNMENT);
       matrix_4x4_ortho(wiiu->menu_shader_ubo->mvp, 0, 1, 1, 0, -1, 1);
       wiiu->menu_shader_ubo->OutputSize.width = wiiu->color_buffer.surface.width;
       wiiu->menu_shader_ubo->OutputSize.height = wiiu->color_buffer.surface.height;
