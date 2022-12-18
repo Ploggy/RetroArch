@@ -29,14 +29,6 @@
 /*	Settings */
 #define NUM_STACK_TRACE_LINES 5
 
-/*	Externals
-	From the linker scripts.
-*/
-extern unsigned int __code_start;
-#define TEXT_START (unsigned int)&__code_start
-extern unsigned int __code_end;
-#define TEXT_END (unsigned int)&__code_end
-
 void test_os_exceptions(void);
 void exception_print_symbol(uint32_t addr);
 
@@ -211,17 +203,8 @@ BOOL __attribute__((__noreturn__)) exception_prog_cb(OSContext* ctx)
 
 void exception_print_symbol(uint32_t addr)
 {
-   /*	Check if addr is within this RPX's .text */
-   if (addr >= TEXT_START && addr < TEXT_END)
-   {
-      char symbolName[64];
-      OSGetSymbolName(addr, symbolName, 63);
-
-      buf_add("%08" PRIX32 "(%08" PRIX32 "):%s\n",
-            addr, addr - TEXT_START, symbolName);
-   }
    /*	Check if addr is within the system library area... */
-   else if ((addr >= 0x01000000 && addr < 0x01800000) ||
+   if ((addr >= 0x01000000 && addr < 0x01800000) ||
          /*	Or the rest of the app executable area.
             I would have used whatever method JGeckoU uses to determine
             the real lowest address, but *someone* didn't make it open-source :/ */
