@@ -32,12 +32,14 @@
 
 #include <string/stdstring.h>
 
-#include <wiiu/gx2.h>
-#include <wiiu/kpad.h>
-#include <wiiu/ios.h>
-#include <wiiu/os.h>
-#include <wiiu/procui.h>
-#include <wiiu/sysapp.h>
+#include <coreinit/ios.h>
+#include <coreinit/foreground.h>
+#include <coreinit/time.h>
+#include <proc_ui/procui.h>
+#include <padscore/wpad.h>
+#include <padscore/kpad.h>
+#include <sysapp/launch.h>
+#include <gx2/event.h>
 
 #include <whb/log.h>
 #include <whb/log_udp.h>
@@ -62,11 +64,20 @@
 #endif
 #endif
 
+#ifdef HAVE_LIBMOCHA
+#include <mocha/mocha.h>
+#ifdef HAVE_LIBFAT
+#include <fat.h>
+#endif
+#endif
+
 #include "wiiu_dbg.h"
 #include "system/exception_handler.h"
 #include "system/memory.h"
 
 #define WIIU_SD_PATH "fs:/vol/external01/"
+#define WIIU_SD_FAT_PATH "sd:/"
+#define WIIU_USB_FAT_PATH "usb:/"
 
 /**
  * The Wii U frontend driver, along with the main() method.
@@ -75,7 +86,7 @@
 #ifndef IS_SALAMANDER
 static enum frontend_fork wiiu_fork_mode = FRONTEND_FORK_NONE;
 #endif
-static const char *elf_path_cst = WIIU_SD_PATH "retroarch/retroarch.elf";
+static bool have_libfat = false;
 
 static bool exists(char *path)
 {
@@ -104,7 +115,11 @@ static void fix_asset_directory(void)
 static void frontend_wiiu_get_env_settings(int *argc, char *argv[],
       void *args, void *params_data)
 {
-   fill_pathname_basedir(g_defaults.dirs[DEFAULT_DIR_PORT], elf_path_cst, sizeof(g_defaults.dirs[DEFAULT_DIR_PORT]));
+   if (have_libfat) {
+      strncpy(g_defaults.dirs[DEFAULT_DIR_PORT], WIIU_SD_FAT_PATH "retroarch/", sizeof(g_defaults.dirs[DEFAULT_DIR_PORT]));
+   } else {
+      strncpy(g_defaults.dirs[DEFAULT_DIR_PORT], WIIU_SD_PATH "retroarch/", sizeof(g_defaults.dirs[DEFAULT_DIR_PORT]));
+   }
 
    fill_pathname_join(g_defaults.dirs[DEFAULT_DIR_CORE_ASSETS], g_defaults.dirs[DEFAULT_DIR_PORT],
          "downloads", sizeof(g_defaults.dirs[DEFAULT_DIR_CORE_ASSETS]));
@@ -185,10 +200,22 @@ static int frontend_wiiu_parse_drive_list(void *data, bool load_content)
    if (!list)
       return -1;
 
-   menu_entries_append(list, WIIU_SD_PATH,
-         msg_hash_to_str(MENU_ENUM_LABEL_FILE_DETECT_CORE_LIST_PUSH_DIR),
-         enum_idx,
-         FILE_TYPE_DIRECTORY, 0, 0, NULL);
+   if (have_libfat) {
+       menu_entries_append(list, WIIU_SD_FAT_PATH,
+                           msg_hash_to_str(MENU_ENUM_LABEL_FILE_DETECT_CORE_LIST_PUSH_DIR),
+                           enum_idx,
+                           FILE_TYPE_DIRECTORY, 0, 0, NULL);
+       menu_entries_append(list, WIIU_USB_FAT_PATH,
+                           msg_hash_to_str(MENU_ENUM_LABEL_FILE_DETECT_CORE_LIST_PUSH_DIR),
+                           enum_idx,
+                           FILE_TYPE_DIRECTORY, 0, 0, NULL);
+   } else {
+       menu_entries_append(list, WIIU_SD_PATH,
+                           msg_hash_to_str(MENU_ENUM_LABEL_FILE_DETECT_CORE_LIST_PUSH_DIR),
+                           enum_idx,
+                           FILE_TYPE_DIRECTORY, 0, 0, NULL);
+   }
+
 #endif
    return 0;
 }
@@ -244,7 +271,8 @@ static void get_arguments(int *argc, char ***argv);
 static void main_loop(void);
 #endif
 static void main_teardown(void);
-
+static void init_filesystems(void);
+static void deinit_filesystems(void);
 static void init_logging(void);
 static void deinit_logging(void);
 static ssize_t wiiu_log_write(struct _reent *r, void *fd, const char *ptr, size_t len);
@@ -279,6 +307,7 @@ static void main_setup(void)
    setup_os_exceptions();
    init_logging();
    ProcUIInit(&SaveCallback);
+   init_filesystems();
    init_pad_libraries();
    verbosity_enable();
    fflush(stdout);
@@ -287,6 +316,7 @@ static void main_setup(void)
 static void main_teardown(void)
 {
    deinit_pad_libraries();
+   deinit_filesystems();
    ProcUIShutdown();
    deinit_logging();
    memoryRelease();
@@ -328,6 +358,25 @@ static void main_loop(void)
 static void SaveCallback(void)
 {
    OSSavesDone_ReadyToRelease();
+}
+
+static void init_filesystems(void)
+{
+#if defined(HAVE_LIBMOCHA) && defined(HAVE_LIBFAT)
+    if (Mocha_InitLibrary() == MOCHA_RESULT_SUCCESS)
+        have_libfat = fatInitDefault();
+#endif
+}
+
+static void deinit_filesystems(void)
+{
+#if defined(HAVE_LIBMOCHA) && defined(HAVE_LIBFAT)
+    if (have_libfat) {
+        fatUnmount("sd");
+        fatUnmount("usb");
+        Mocha_DeInitLibrary();
+    }
+#endif
 }
 
 static devoptab_t dotab_stdout =
