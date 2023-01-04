@@ -262,13 +262,22 @@ void exception_print_symbol(uint32_t addr)
 /*	void setup_os_exceptions(void)
 	Install and initialize the exception handler.
 */
-void setup_os_exceptions(void)
+void init_os_exceptions(void)
 {
    exception_msgbuf = malloc(4096);
    OSSetExceptionCallback(OS_EXCEPTION_TYPE_DSI, exception_dsi_cb);
    OSSetExceptionCallback(OS_EXCEPTION_TYPE_ISI, exception_isi_cb);
    OSSetExceptionCallback(OS_EXCEPTION_TYPE_PROGRAM, exception_prog_cb);
    test_os_exceptions();
+}
+
+void deinit_os_exceptions(void)
+{
+    OSSetExceptionCallback(OS_EXCEPTION_TYPE_DSI, NULL);
+    OSSetExceptionCallback(OS_EXCEPTION_TYPE_ISI, NULL);
+    OSSetExceptionCallback(OS_EXCEPTION_TYPE_PROGRAM, NULL);
+    free(exception_msgbuf);
+    exception_msgbuf = NULL;
 }
 
 /*	void test_os_exceptions(void)

@@ -435,7 +435,7 @@ int main(int argc, char **argv)
 static void main_setup(void)
 {
    memoryInitialize();
-   //setup_os_exceptions();
+   init_os_exceptions();
    init_logging();
    init_filesystems();
    init_pad_libraries();
@@ -448,6 +448,7 @@ static void main_teardown(void)
    deinit_pad_libraries();
    deinit_filesystems();
    deinit_logging();
+   deinit_os_exceptions();
    memoryRelease();
 }
 
