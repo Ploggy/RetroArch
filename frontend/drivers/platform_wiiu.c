@@ -32,6 +32,7 @@
 
 #include <string/stdstring.h>
 
+#include <coreinit/dynload.h>
 #include <coreinit/ios.h>
 #include <coreinit/foreground.h>
 #include <coreinit/time.h>
@@ -86,8 +87,9 @@
 
 #ifndef IS_SALAMANDER
 static enum frontend_fork wiiu_fork_mode = FRONTEND_FORK_NONE;
+static bool have_libfat_usb = false;
+static bool have_libfat_sdcard = false;
 #endif
-static bool have_libfat = false;
 static bool in_exec = false;
 
 static bool exists(char *path)
@@ -117,11 +119,10 @@ static void fix_asset_directory(void)
 static void frontend_wiiu_get_env_settings(int *argc, char *argv[],
       void *args, void *params_data)
 {
-   if (have_libfat) {
+   if (have_libfat_sdcard)
       strncpy(g_defaults.dirs[DEFAULT_DIR_PORT], WIIU_SD_FAT_PATH "retroarch/", sizeof(g_defaults.dirs[DEFAULT_DIR_PORT]));
-   } else {
+   else
       strncpy(g_defaults.dirs[DEFAULT_DIR_PORT], WIIU_SD_PATH "retroarch/", sizeof(g_defaults.dirs[DEFAULT_DIR_PORT]));
-   }
 
    fill_pathname_join(g_defaults.dirs[DEFAULT_DIR_CORE_ASSETS], g_defaults.dirs[DEFAULT_DIR_PORT],
          "downloads", sizeof(g_defaults.dirs[DEFAULT_DIR_CORE_ASSETS]));
@@ -202,21 +203,23 @@ static int frontend_wiiu_parse_drive_list(void *data, bool load_content)
    if (!list)
       return -1;
 
-   if (have_libfat) {
-       menu_entries_append(list, WIIU_SD_FAT_PATH,
-                           msg_hash_to_str(MENU_ENUM_LABEL_FILE_DETECT_CORE_LIST_PUSH_DIR),
-                           enum_idx,
-                           FILE_TYPE_DIRECTORY, 0, 0, NULL);
+
+   if (have_libfat_sdcard)
+      menu_entries_append(list, WIIU_SD_FAT_PATH,
+                          msg_hash_to_str(MENU_ENUM_LABEL_FILE_DETECT_CORE_LIST_PUSH_DIR),
+                          enum_idx,
+                          FILE_TYPE_DIRECTORY, 0, 0, NULL);
+   else
+      menu_entries_append(list, WIIU_SD_PATH,
+                          msg_hash_to_str(MENU_ENUM_LABEL_FILE_DETECT_CORE_LIST_PUSH_DIR),
+                          enum_idx,
+                          FILE_TYPE_DIRECTORY, 0, 0, NULL);
+
+   if (have_libfat_usb)
        menu_entries_append(list, WIIU_USB_FAT_PATH,
                            msg_hash_to_str(MENU_ENUM_LABEL_FILE_DETECT_CORE_LIST_PUSH_DIR),
                            enum_idx,
                            FILE_TYPE_DIRECTORY, 0, 0, NULL);
-   } else {
-       menu_entries_append(list, WIIU_SD_PATH,
-                           msg_hash_to_str(MENU_ENUM_LABEL_FILE_DETECT_CORE_LIST_PUSH_DIR),
-                           enum_idx,
-                           FILE_TYPE_DIRECTORY, 0, 0, NULL);
-   }
 
 #endif
    return 0;
@@ -459,6 +462,7 @@ static void main_teardown(void)
 #define MII_MAKER_USA_TITLE_ID (0x000500101004A100)
 #define MII_MAKER_EUR_TITLE_ID (0x000500101004A200)
 
+static bool in_aroma = false;
 static bool in_hbl = false;
 static void proc_setup(void)
 {
@@ -473,6 +477,14 @@ static void proc_setup(void)
         // Important: OSEnableHomeButtonMenu must come before ProcUIInitEx.
         OSEnableHomeButtonMenu(FALSE);
         in_hbl = TRUE;
+    }
+
+    /* Detect Aroma explicitly (it's possible to run under H&S while using Tiramisu) */
+    OSDynLoad_Module rpxModule;
+    if (OSDynLoad_Acquire("homebrew_rpx_loader", &rpxModule) == OS_DYNLOAD_OK)
+    {
+        in_aroma = true;
+        OSDynLoad_Release(rpxModule);
     }
 
     ProcUIInit(&proc_save_callback);
@@ -589,18 +601,24 @@ static void init_filesystems(void)
 {
 #if defined(HAVE_LIBMOCHA) && defined(HAVE_LIBFAT)
     if (Mocha_InitLibrary() == MOCHA_RESULT_SUCCESS)
-        have_libfat = fatInitDefault();
+    {
+        have_libfat_usb    = fatMount("usb", &Mocha_usb_disc_interface, 0, 512, 128);
+       /* Mounting SD card with libfat is unsafe under Aroma */
+       if (!in_aroma)
+          have_libfat_sdcard = fatMount("sd", &Mocha_sdio_disc_interface, 0, 512, 128);
+    }
 #endif
 }
 
 static void deinit_filesystems(void)
 {
 #if defined(HAVE_LIBMOCHA) && defined(HAVE_LIBFAT)
-    if (have_libfat) {
-        fatUnmount("sd");
-        fatUnmount("usb");
-        Mocha_DeInitLibrary();
-    }
+   if (have_libfat_usb)
+      fatUnmount("usb");
+   if (have_libfat_sdcard)
+      fatUnmount("sd");
+
+   Mocha_DeInitLibrary();
 #endif
 }
 
