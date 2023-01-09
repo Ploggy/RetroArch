@@ -230,10 +230,14 @@ static void frontend_wiiu_exec(const char *path, bool should_load_content)
     /* goal: make one big buffer with all the argv's, seperated by NUL. we can then pass this thru sysapp! */
     char* argv_buf;
     size_t n, argv_len = strlen(path) + 1; /* argv[0] plus null */
-    const char *content = path_get(RARCH_PATH_CONTENT);
 
+#ifndef IS_SALAMANDER
+    const char *content = path_get(RARCH_PATH_CONTENT);
     const char *content_args[2] = {content, NULL };
+#ifdef HAVE_NETWORKING
     const char *netplay_args[NETPLAY_FORK_MAX_ARGS];
+#endif
+#endif
     /* args will select between content_args, netplay_args, or no args (default) */
     const char **args = NULL;
 
@@ -242,6 +246,7 @@ static void frontend_wiiu_exec(const char *path, bool should_load_content)
     MochaUtilsStatus ret;
     SYSStandardArgsIn std_args = { 0 };
 
+#ifndef IS_SALAMANDER
     if (should_load_content)
     {
 #ifdef HAVE_NETWORKING
@@ -263,6 +268,7 @@ static void frontend_wiiu_exec(const char *path, bool should_load_content)
             args = content_args;
         }
     }
+#endif
 
     argv_buf = malloc(argv_len);
     argv_buf[0] = '\0';
@@ -282,7 +288,11 @@ static void frontend_wiiu_exec(const char *path, bool should_load_content)
         path_relative_to(load_info.path, path, "fs:/vol/external01/", sizeof(load_info.path));
     else if (string_starts_with(path, "sd:/"))
         path_relative_to(load_info.path, path, "sd:/", sizeof(load_info.path));
-    else goto cleanup; // bail if not on the SD card
+    else goto cleanup; /* bail if not on the SD card */
+
+    /* Mocha might not be init'd (Salamander) */
+    if (Mocha_InitLibrary() != MOCHA_RESULT_SUCCESS)
+        goto cleanup;
 
     load_info.target = LOAD_RPX_TARGET_SD_CARD;
     ret = Mocha_PrepareRPXLaunch(&load_info);
@@ -539,7 +549,11 @@ static void sysapp_arg_cb(SYSDeserializeArg* arg, void* usr)
 
 static void get_arguments(int *argc, char ***argv)
 {
-    static char* _argv[2 + NETPLAY_FORK_MAX_ARGS];
+#ifdef HAVE_NETWORKING
+    static char* _argv[1 + NETPLAY_FORK_MAX_ARGS];
+#else
+    static char* _argv[2];
+#endif
     int _argc = 0;
     SYSStandardArgs std_args = { 0 };
 
