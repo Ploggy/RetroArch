@@ -19,7 +19,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
-#include <wiiu/os.h>
+#include <coreinit/exception.h>
+#include <coreinit/memorymap.h>
+#include <coreinit/debug.h>
+#include <coreinit/dynload.h>
 #include "wiiu_dbg.h"
 #include "exception_handler.h"
 #include "version.h"
@@ -37,13 +40,6 @@ typedef struct _framerec
    struct _framerec* up;
    void* lr;
 } frame_rec, *frame_rec_t;
-
-/*	Fill in a few gaps in thread.h
-	Dimok calls these exception_specific0 and 1;
-	though we may as well name them by their function.
-*/
-#define dsisr __unknown[0]
-#define dar __unknown[1]
 
 /*	Some bitmasks for determining DSI causes.
 	Taken from the PowerPC Programming Environments Manual (32-bit).
@@ -81,7 +77,7 @@ char* exception_msgbuf;
 void __attribute__((__noreturn__)) exception_cb(OSContext* ctx, OSExceptionType type)
 {
    /*	No message buffer available, fall back onto MEM1 */
-   if (!exception_msgbuf || !OSEffectiveToPhysical(exception_msgbuf))
+   if (!exception_msgbuf || !OSEffectiveToPhysical((uint32_t)exception_msgbuf))
       exception_msgbuf = (char*)0xF4000000;
 
    /*	First up, the pretty header that tells you wtf just happened */

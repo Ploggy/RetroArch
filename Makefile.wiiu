@@ -2,7 +2,7 @@ TARGET := retroarch_wiiu
 
 DEBUG                      = 0
 GRIFFIN_BUILD              = 0
-SALAMANDER_BUILD           = 0
+SALAMANDER_BUILD          ?= 0
 HAVE_STATIC_DUMMY ?= 0
 WHOLE_ARCHIVE_LINK         = 0
 WIIU_HID                   = 1

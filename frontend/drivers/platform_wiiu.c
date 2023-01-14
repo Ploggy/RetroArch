@@ -22,8 +22,6 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 
-#include <wiiu/types.h>
-#include <wiiu/ac.h>
 #include <file/file_path.h>
 
 #ifndef IS_SALAMANDER
@@ -119,9 +117,11 @@ static void fix_asset_directory(void)
 static void frontend_wiiu_get_env_settings(int *argc, char *argv[],
       void *args, void *params_data)
 {
+#ifndef IS_SALAMANDER
    if (have_libfat_sdcard)
       strncpy(g_defaults.dirs[DEFAULT_DIR_PORT], WIIU_SD_FAT_PATH "retroarch/", sizeof(g_defaults.dirs[DEFAULT_DIR_PORT]));
    else
+#endif
       strncpy(g_defaults.dirs[DEFAULT_DIR_PORT], WIIU_SD_PATH "retroarch/", sizeof(g_defaults.dirs[DEFAULT_DIR_PORT]));
 
    fill_pathname_join(g_defaults.dirs[DEFAULT_DIR_CORE_ASSETS], g_defaults.dirs[DEFAULT_DIR_PORT],
@@ -466,7 +466,6 @@ static void main_teardown(void)
 }
 
 // https://github.com/devkitPro/wut/blob/7d9fa9e416bffbcd747f1a8e5701fd6342f9bc3d/libraries/libwhb/src/proc.c
-
 #define HBL_TITLE_ID (0x0005000013374842)
 #define MII_MAKER_JPN_TITLE_ID (0x000500101004A000)
 #define MII_MAKER_USA_TITLE_ID (0x000500101004A100)
