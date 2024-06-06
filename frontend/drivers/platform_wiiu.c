@@ -78,6 +78,7 @@
 #include "system/memory.h"
 
 #define WIIU_SD_PATH "fs:/vol/external01/"
+#define WIIU_WUHB_PATH "fs:/vol/content/"
 #define WIIU_SD_FAT_PATH "sd:/"
 #define WIIU_USB_FAT_PATH "usb:/"
 
@@ -116,6 +117,15 @@ static void fix_asset_directory(void)
    rename(src_path_buf, dst_path_buf);
 }
 
+static bool wuhb_assets_exist(void)
+{
+   char path_buf[PATH_MAX_LENGTH] = {0};
+
+   fill_pathname_join(path_buf, WIIU_WUHB_PATH, "assets", sizeof(path_buf));
+
+   return exists(path_buf);
+}
+
 static void frontend_wiiu_get_env_settings(int *argc, char *argv[],
       void *args, void *params_data)
 {
@@ -128,9 +138,15 @@ static void frontend_wiiu_get_env_settings(int *argc, char *argv[],
 
    fill_pathname_join(g_defaults.dirs[DEFAULT_DIR_CORE_ASSETS], g_defaults.dirs[DEFAULT_DIR_PORT],
          "downloads", sizeof(g_defaults.dirs[DEFAULT_DIR_CORE_ASSETS]));
+
    fix_asset_directory();
-   fill_pathname_join(g_defaults.dirs[DEFAULT_DIR_ASSETS], g_defaults.dirs[DEFAULT_DIR_PORT],
-         "assets", sizeof(g_defaults.dirs[DEFAULT_DIR_ASSETS]));
+   if (wuhb_assets_exist())
+      fill_pathname_join(g_defaults.dirs[DEFAULT_DIR_ASSETS], WIIU_WUHB_PATH,
+                         "assets", sizeof(g_defaults.dirs[DEFAULT_DIR_ASSETS]));
+   else
+      fill_pathname_join(g_defaults.dirs[DEFAULT_DIR_ASSETS], g_defaults.dirs[DEFAULT_DIR_PORT],
+                         "assets", sizeof(g_defaults.dirs[DEFAULT_DIR_ASSETS]));
+
    fill_pathname_join(g_defaults.dirs[DEFAULT_DIR_CORE], g_defaults.dirs[DEFAULT_DIR_PORT],
          "cores", sizeof(g_defaults.dirs[DEFAULT_DIR_CORE]));
    fill_pathname_join(g_defaults.dirs[DEFAULT_DIR_CORE_INFO], g_defaults.dirs[DEFAULT_DIR_CORE],
