@@ -15,7 +15,6 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  ****************************************************************************/
 #include <malloc.h>
-#include <string.h>
 #include "memory.h"
 #include <coreinit/memheap.h>
 #include <coreinit/memexpheap.h>
@@ -81,7 +80,7 @@ void * MEM1_alloc(unsigned int size, unsigned int align)
 
 void MEM1_free(void *ptr)
 {
-   if (ptr)
+   if (ptr && ProcUIInForeground())
       MEMFreeToExpHeap(mem1_heap, ptr);
 }
 
@@ -94,6 +93,6 @@ void * MEMBucket_alloc(unsigned int size, unsigned int align)
 
 void MEMBucket_free(void *ptr)
 {
-   if (ptr)
+   if (ptr && ProcUIInForeground())
       MEMFreeToExpHeap(bucket_heap, ptr);
 }
