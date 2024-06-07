@@ -1,0 +1,1635 @@
+diff --git a/Makefile.common b/Makefile.common
+index c69472a..345bd8c 100644
+--- a/Makefile.common
++++ b/Makefile.common
+@@ -1201,6 +1201,9 @@
+ 	   input/drivers_joypad/wiiu/kpad_driver.o \
+ 	   input/drivers_joypad/wiiu/pad_functions.o \
+ 	   audio/drivers/wiiu_audio.o \
++	   audio/drivers/wiiu_audio2.o \
++	   audio/drivers/wiiu_audio2_core.o \
++	   audio/drivers/wiiu_audio2_ext.o \
+ 	   frontend/drivers/platform_wiiu.o
+ 
+       ifeq ($(WIIU_HID),1)
+diff --git a/Makefile.wiiu b/Makefile.wiiu
+index 1ca804a..6f04598 100644
+--- a/Makefile.wiiu
++++ b/Makefile.wiiu
+@@ -189,6 +189,10 @@
+    DEFINES += -DPC_DEVELOPMENT_TCP_PORT=$(PC_DEVELOPMENT_TCP_PORT)
+ endif
+ 
++ifneq ($(WIIU_AUDIO_OPTIMIZATION_LEVEL),)
++   DEFINES += -DWIIU_AUDIO_OPTIMIZATION_LEVEL=$(WIIU_AUDIO_OPTIMIZATION_LEVEL)
++endif
++
+ INCDIRS += -I.
+ INCDIRS += -Ilibretro-common/include
+ INCDIRS += -Iwiiu
+diff --git a/audio/audio_driver.c b/audio/audio_driver.c
+index f529730..e357311 100644
+--- a/audio/audio_driver.c
++++ b/audio/audio_driver.c
+@@ -142,6 +142,7 @@
+ #endif
+ #ifdef WIIU
+    &audio_ax,
++   &audio_axpro,
+ #endif
+ #if defined(EMSCRIPTEN) && defined(HAVE_RWEBAUDIO)
+    &audio_rwebaudio,
+@@ -528,6 +529,12 @@
+       audio_st->last_flush_time = flush_time;
+    }
+ 
++#if WIIU_AUDIO_OPTIMIZATION_LEVEL == 1
++   // make sure wiiu axpro audio driver is done with reading float samples
++   void axpro_audio_wait_fence(void* context_audio_data, void* client_buffer); // no-op when not using axpro audio driver
++   axpro_audio_wait_fence(audio_st->context_audio_data, audio_st->output_samples_buf);
++#endif
++
+    audio_st->resampler->process(
+          audio_st->resampler_data, &src_data);
+ 
+@@ -852,6 +859,16 @@
+ 
+ size_t audio_driver_sample_batch(const int16_t *data, size_t frames)
+ {
++#if WIIU_AUDIO_OPTIMIZATION_LEVEL >= 2
++   // optimization for avoiding RA resampler and letting audio driver handle core writing
++   // RA options like record, rate control, etc cannot be supported when this is used.
++   audio_driver_state_t* audio_st = &audio_driver_st;
++   if(frames > 1)
++   {  if((audio_st->flags & (AUDIO_FLAG_SUSPENDED|AUDIO_FLAG_ACTIVE)) == AUDIO_FLAG_ACTIVE)
++      return audio_st->current_audio->write(audio_st->context_audio_data, data, frames * 4);
++   }
++   return frames;
++#else
+    uint32_t runloop_flags;
+    size_t frames_remaining        = frames;
+    recording_state_t *record_st   = recording_state_get_ptr();
+@@ -901,6 +918,7 @@
+       data             += frames_to_write << 1;
+    }
+    while (frames_remaining > 0);
++#endif // WIIU_AUDIO_OPTIMIZATION_LEVEL < 2
+ 
+    return frames;
+ }
+diff --git a/audio/audio_driver.h b/audio/audio_driver.h
+index d26b005..49568fe 100644
+--- a/audio/audio_driver.h
++++ b/audio/audio_driver.h
+@@ -428,6 +428,7 @@
+ extern audio_driver_t audio_ps3;
+ extern audio_driver_t audio_gx;
+ extern audio_driver_t audio_ax;
++extern audio_driver_t audio_axpro;
+ extern audio_driver_t audio_psp;
+ extern audio_driver_t audio_ps2;
+ extern audio_driver_t audio_ctr_csnd;
+diff --git a/audio/drivers/wiiu_audio2.c b/audio/drivers/wiiu_audio2.c
+new file mode 100644
+index 0000000..9a0ef3c
+--- /dev/null
++++ b/audio/drivers/wiiu_audio2.c
+@@ -0,0 +1,460 @@
++/*  RetroArch - A frontend for libretro.
++ *  Copyright (C) 2023-2024 - vrda
++ *
++ *  RetroArch is free software: you can redistribute it and/or modify it under the terms
++ *  of the GNU General Public License as published by the Free Software Found-
++ *  ation, either version 3 of the License, or (at your option) any later version.
++ *
++ *  RetroArch is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
++ *  without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
++ *  PURPOSE.  See the GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License along with RetroArch.
++ *  If not, see <http://www.gnu.org/licenses/>.
++ */
++#include "wiiu_audio2.h"
++
++
++// just couldn't resist using global data, at least separate the cache lines
++typedef struct GlobalDataMainCore
++{   AXProMainCore*          mc;
++    uint32_t                unusedu[3];
++//--
++    AXProMsgMain2Audio      msg_setcallback;
++//--
++
++} GlobalDataMainCore; AXPRO_ALIGNED_DECLARE_CLINE2(static GlobalDataMainCore gm);
++
++
++
++
++// audio core init
++//----------------------------------------------------
++
++static void _axpro_init_streaming(AXProAudioCore* ac, uint32_t streamblocks, uint32_t streamblock_bytes, uint32_t frames_per_interrupt, float req_rate)
++{
++    uint32_t streamblock_frames = streamblock_bytes / (AXPRO_CHANNELS * AXPRO_SAMPLE_BYTES);
++    
++    ac->streamblocks = (uint16_t) streamblocks;
++    ac->streamblock_frames = (uint16_t) streamblock_frames;
++    ac->streamblock_bytes = streamblock_bytes;
++    ac->streamblock_channel_bytes = streamblock_bytes / AXPRO_CHANNELS;
++    
++    ac->interrupt_data.streamblock_frames = (uint16_t) streamblock_frames;
++    ac->interrupt_data.streamblock_samples = (uint16_t) streamblock_frames * AXPRO_CHANNELS;
++    ac->interrupt_data.streamblocks = streamblocks;
++    ac->interrupt_data.frames_per_interrupt = (uint16_t) frames_per_interrupt;
++    #if AXPRO_RATE_CONTROL_AMORTIZER
++    {   float hw_rate = (float) AXPRO_SAMPLE_RATE;
++        float block_duration = (float)streamblock_frames / req_rate;
++        uint16_t rate_blocks_half = (uint16_t) streamblocks >> 1;
++        uint16_t rate_blocks_quarter = (uint16_t) streamblocks >> 2;
++        ac->interrupt_data.rate_blocks_low = rate_blocks_half;
++        ac->interrupt_data.rate_blocks_hi = rate_blocks_half + rate_blocks_quarter;
++        ac->interrupt_data.rate_src_ratios[0] = req_rate / hw_rate;
++        ac->interrupt_data.rate_src_ratios[1] = (req_rate - AXPRO_RATE_LOW) / hw_rate;
++        ac->interrupt_data.rate_src_ratios[2] = (req_rate - AXPRO_RATE_LOWER) / hw_rate;
++        ac->interrupt_data.rate_change_timeout_normal = (uint16_t) (AXPRO_RATE_DURATION_NORMAL / block_duration);
++        ac->interrupt_data.rate_change_timeout_slow = (uint16_t) (AXPRO_RATE_DURATION_LOW / block_duration);
++    }
++    #endif
++    ac->voicebuff_free_blocks = streamblocks;
++    ac->lc_missing_block_frames = (uint16_t) streamblock_frames;
++    //print_ac("axpro blocks=%d, block_bytes=%d, block_samples=%d\n", streamblocks, streamblock_bytes, streamblock_bytes / (AXPRO_CHANNELS * AXPRO_SAMPLE_BYTES));
++}
++
++int axpro_core_main(int args, OSMessageQueue* q2main);
++void axpro_audioframe_callback();
++void _axpro_write(AXProAudioCore* ac);
++
++static void axpro_hw_ready(AXProMainCore* mc) 
++{   mc->flags |= AXPMCF_HW_READY;
++    mc->total_streamblocks = mc->msg.hwready.streamblocks;
++}
++
++void axpro_hw_closed(AXProMainCore* mc) { mc->flags |= AXPMCF_HW_CLOSED; }
++
++
++static void _axpro_init_timing(AXProAudioCore* ac, float req_latency_ms, float req_rate)
++{
++    // buffer size and single stream block size
++    uint32_t streamblock_bytes, streamblocks, frames_per_interrupt;
++    {   frames_per_interrupt = (uint32_t) ceilf( ((req_rate * AXPRO_INTERRUPT_INTERVAL_MS) / 1000.0f) );
++        uint32_t interrupts_for_max_latency = (uint32_t) ceilf(req_latency_ms / (float) AXPRO_INTERRUPT_INTERVAL_MS );
++        if(interrupts_for_max_latency < AXPRO_STREAMBLOCK_INTERRUPTS)
++        interrupts_for_max_latency = AXPRO_STREAMBLOCK_INTERRUPTS;
++
++        // make every channel size nicely aligned
++        streamblock_bytes = frames_per_interrupt * AXPRO_STREAMBLOCK_INTERRUPTS * AXPRO_SAMPLE_BYTES;
++        AXPRO_ALIGN_SIZE(streamblock_bytes, AXPRO_CACHEFETCH_SIZE);
++        streamblock_bytes *= AXPRO_CHANNELS;
++
++        uint32_t max_latency_bytes = (interrupts_for_max_latency * frames_per_interrupt) * (AXPRO_CHANNELS * AXPRO_SAMPLE_BYTES);
++        streamblocks = (max_latency_bytes / streamblock_bytes) + 1;
++
++        // make the streamblock number even and at least 2
++        if(streamblocks > 1) AXPRO_ALIGN_SIZE(streamblocks, 2);
++        else streamblocks = 2;
++    }
++    _axpro_init_streaming(ac, streamblocks, streamblock_bytes, frames_per_interrupt, req_rate);
++}
++
++static void _axpro_assign_voices_to_devices(AXProAudioCore* ac)
++{
++    // fcon: what about wii set to surround mode ?
++    AXVoiceDeviceMixData channel_mix[6];
++    memset(channel_mix, 0, sizeof(channel_mix));
++    channel_mix[0].bus[0].volume = 0x8000; // 1.0 in 1:15 fixed point
++    AXSetVoiceDeviceMix(ac->interrupt_data.voice_l, AX_DEVICE_TYPE_TV, 0, channel_mix);
++    AXSetVoiceDeviceMix(ac->interrupt_data.voice_l, AX_DEVICE_TYPE_DRC, 0, channel_mix);
++    channel_mix[0].bus[0].volume = 0;
++    channel_mix[1].bus[0].volume = 0x8000; // 1.0 in 1:15 fixed point
++    AXSetVoiceDeviceMix(ac->interrupt_data.voice_r, AX_DEVICE_TYPE_TV, 0, channel_mix);
++    AXSetVoiceDeviceMix(ac->interrupt_data.voice_r, AX_DEVICE_TYPE_DRC, 0, channel_mix);
++}
++
++static AXVoice* _axpro_create_voice(AXProAudioCore* ac, int16_t* sample_buffer, uint32_t voice_samplerate)
++{
++    // alloc voice and prepare it for looped playing
++    AXVoice* voice = AXAcquireVoice(AXPRO_VOICE_PRIORITY, NULL, 0);
++    if(voice)
++    {
++        // setup voice initially
++        AXVoiceOffsets offsets;
++           offsets.dataType        = AXPRO_VOICE_FORMAT;
++           offsets.loopingEnabled  = 1;
++           offsets.loopOffset      = ac->streamblock_frames << 1;
++           offsets.endOffset       = ac->streamblock_frames - 1;
++           offsets.currentOffset   = 0;
++           offsets.data            = sample_buffer;
++        AXSetVoiceOffsets(voice, &offsets);
++        bool needs_resampler = AXPRO_RATE_CONTROL_AMORTIZER || (voice_samplerate != AXPRO_SAMPLE_RATE);
++        AXSetVoiceSrcType(voice,  needs_resampler ? AXPRO_INIT_RESAMPLER                                    : AX_VOICE_SRC_TYPE_NONE);
++        AXSetVoiceSrcRatio(voice, needs_resampler ? (float) voice_samplerate / (float) AXPRO_SAMPLE_RATE    : 1.0f);
++        AXVoiceVeData vol_envelope; vol_envelope.volume = 0x8000; vol_envelope.delta = 0;
++        AXSetVoiceVe(voice, &vol_envelope);
++        return voice;
++    }
++    return NULL;
++}
++
++// prepare audio hardware
++static void _axpro_init_hw(AXProAudioCore* ac)
++{
++    // hw startup with desired pipeline setup, prepare timing vars
++    AXInitParams init_params;memset(&init_params, 0, sizeof(AXInitParams));
++        init_params.renderer = AXPRO_INIT_RENDERER;
++        init_params.pipeline = AXPRO_INIT_PIPELINE;
++    AXInitWithParams(&init_params);
++    _axpro_init_timing(ac, (float)ac->msg.init.latency, (float)ac->msg.init.rate);
++
++    uint32_t init_error_code = 0;
++    #define fail_with_error_code(Code)  \
++    {   init_error_code = Code;         \
++        goto init_error;                \
++    }
++
++    // prepare locked cache
++    if(LCEnableDMA())
++    {   uint32_t lc_size = ac->streamblock_bytes * AXPRO_STREAMBLOCKS_LC;
++        AXPRO_ALIGN_SIZE(lc_size, AXPRO_LCACHE_ALIGNMENT);
++        int16_t* lc_base = (int16_t*) LCAlloc(lc_size);
++        if(lc_base) 
++        {   ac->lc_base = lc_base;
++            ac->lc_base_circular = lc_base;
++            ac->lc_block_writepos = lc_base;
++            ac->lc_block_base = lc_base;
++            ac->lc_last_block = (int16_t*) ((uint8_t*) lc_base + (ac->streamblock_bytes * (uint32_t) (AXPRO_STREAMBLOCKS_LC-1)));
++        } else fail_with_error_code(2);
++    } else fail_with_error_code(1);
++
++    // alloc sample buffer (interleaved left and right)
++    {   uint32_t buffer_size = ac->streamblock_bytes * (uint32_t) ac->streamblocks;
++        ac->voicebuff = (int16_t*) AXPro_MemAlloc(buffer_size, AXPRO_SAMPLEBUFF_ALIGNMENT);
++        ac->voicebuff_last_block = ac->voicebuff + ((uint32_t)(ac->streamblocks - 1) * ac->streamblock_frames * AXPRO_CHANNELS);
++        ac->voicebuff_writeblock = ac->voicebuff;
++        ac->interrupt_data.voicebuff_l = &ac->voicebuff[0];
++        if(!ac->voicebuff) fail_with_error_code(3);
++    }
++
++    // setup AX voices
++    ac->interrupt_data.voice_l = _axpro_create_voice(ac, &ac->voicebuff[0], ac->msg.init.rate);
++    ac->interrupt_data.voice_r = _axpro_create_voice(ac, &ac->voicebuff[ac->streamblock_frames], ac->msg.init.rate);
++    if(!ac->interrupt_data.voice_l || !ac->interrupt_data.voice_r) fail_with_error_code(4);
++    _axpro_assign_voices_to_devices(ac);
++
++    // let main core have info on internal buffer layouts
++    {   AXPRO_ALIGNED_DECLARE_CLINE1(AXProMsgAudio2Main msg);
++        msg.Call = axpro_hw_ready;
++        msg.hwready.streamblocks = ac->streamblocks;
++        AXPro_RunMsg(ac->qaudio2main, msg);
++    }
++
++    ac->interrupt_data.prev_ax_framecallback = AXRegisterFrameCallback(axpro_audioframe_callback);
++    return;
++
++init_error:
++    AXPro_RunCtlEx(ac->qaudio2main, AXPMCTL_ERROR_INIT, init_error_code, OS_MESSAGE_FLAGS_BLOCKING);
++}
++
++void axpro_close_hw(AXProAudioCore* ac)
++{
++    AXRegisterFrameCallback(ac->interrupt_data.prev_ax_framecallback);
++    if(ac->lc_base)
++    {   LCDealloc(ac->lc_base);
++        //LCDisableDMA(); // fcon:aroma - check how is this handled system wide, not handling bg switch at the moment and we're defaulting on core 0
++    }
++    if(ac->interrupt_data.voice_r) AXFreeVoice(ac->interrupt_data.voice_r);
++    if(ac->interrupt_data.voice_l) AXFreeVoice(ac->interrupt_data.voice_l);
++    if(ac->voicebuff) AXPro_MemFree(ac->voicebuff);
++    AXQuit();
++}
++
++
++
++
++
++// client core public interface
++//----------------------------------------------------
++
++static void axpro_audio_free(AXProMainCore* mc)
++{
++    if(mc)
++    {   if(mc->qmain2audio)
++        {   // drain our queue and dispatch quit signals
++            while(OSReceiveMessage(&mc->qaudio2main, (OSMessage*) &mc->msg, OS_MESSAGE_FLAGS_NONE)) if(mc->msg.Call) mc->msg.Call(mc);
++            AXPro_RunCtl(mc->qmain2irq, AXPMCTL_QUIT);
++            AXPro_RunCtl(mc->qmain2audio, AXPMCTL_QUIT);
++            AXPro_Wait(mc, mc->flags & AXPMCF_HW_CLOSED, break, break);
++        }
++        AXPro_MemFree(mc);
++        gm.mc = NULL;
++    }
++}
++
++static void* axpro_audio_init(const char* device, unsigned rate, unsigned latency, unsigned block_frames, unsigned* new_rate)
++{
++    AXProMainCore* mc;
++    {   uint32_t main_core_data_sizeof = sizeof(AXProMainCore); AXPRO_ALIGN_SIZE(main_core_data_sizeof, AXPRO_CACHEFETCH_SIZE);
++        mc = (AXProMainCore*) AXPro_MemAlloc(main_core_data_sizeof, AXPRO_CACHEFETCH_SIZE);
++    }
++    if(mc)
++    {   // init model and queue
++        DCZeroRange(mc, sizeof(AXProMainCore));
++        memset(mc, 0, sizeof(AXProMainCore));
++        OSInitMessageQueue(&mc->qaudio2main, mc->msgstore_audio2main, AXPRO_MAX_MSGS_AUDIO2MAIN);
++
++        // fcon: normal core-tied thread can just be created here if default core thread will be used in the future by RetroArch
++        OSThread* audio_thread = OSGetDefaultThread(AXPRO_CORE_AUDIO);
++        OSRunThread(audio_thread, (OSThreadEntryPointFn) axpro_core_main, 1, (const char**)&mc->qaudio2main);
++
++        // wait for audio thread ready then init driver with prepared msg
++        AXProMsgMain2Audio init_msg;
++            init_msg.Call = _axpro_init_hw;
++            init_msg.init.rate = rate;
++            init_msg.init.latency = latency;
++        AXPro_Wait(mc, mc->qmain2audio, goto error_init, goto error_init);
++        AXPro_RunMsg(mc->qmain2audio, init_msg);
++        AXPro_Wait(mc, mc->flags & AXPMCF_HW_READY, goto error_init, goto error_init);
++
++        // prepare write msg - it will point to empy write call when using poll-mode extension
++        mc->writemsg.Call = _axpro_write;
++
++        // also install callback when set before driver was actually created
++        if(gm.msg_setcallback.ctl.setgen.GenerateSamples)
++        AXPro_RunMsg(mc->qmain2audio, gm.msg_setcallback);
++
++
++        // let the system continue on main core
++        *new_rate = rate;
++        gm.mc = mc;
++        return mc;
++
++        error_init:
++        //print_mc("axpro error %d\n", mc->msg.general_args[0]);
++        axpro_audio_free(mc);
++    }
++
++    gm.mc = NULL;
++    return NULL;
++}
++
++static bool axpro_audio_alive(AXProMainCore* mc) { return (mc->flags & (AXPMCF_HW_READY | AXPMCF_HW_CLOSED)) == AXPMCF_HW_READY; }
++static bool axpro_audio_use_float(AXProMainCore* mc) { return (bool) (AXPRO_ACCEPTS_FLOAT_SAMPLES); }
++static void axpro_audio_set_nonblock_state(AXProMainCore* mc, bool toggle) 
++{   if(toggle) mc->flags |= AXPMCF_NONBLOCK;
++    else mc->flags &= ~AXPMCF_NONBLOCK;
++}
++static size_t axpro_audio_write_avail(AXProMainCore* mc) { return mc->free_streamblocks; }
++static size_t axpro_audio_buffer_size(AXProMainCore* mc) { return mc->total_streamblocks; }
++static bool axpro_audio_stop(AXProMainCore* mc);
++static bool axpro_audio_start(AXProMainCore* mc, bool is_shutdown);
++static ssize_t axpro_audio_write_empty(AXProMainCore* mc, AXProInSample* samples, size_t size_bytes);
++
++static ssize_t axpro_audio_write(AXProMainCore* mc, AXProInSample* samples, size_t size_bytes)
++{
++    // normally wait for last write request to at least stop using the client data
++    if(!(mc->flags & AXPMCF_NONBLOCK))
++    {   if(mc->reading_client_buffer)
++        axpro_audio_wait_fence(mc, mc->reading_client_buffer);
++    }
++
++    // drop the data if job is still using the client buffer or we have no free blocks reported
++    else
++    {   axpro_audio_write_empty(mc, NULL, 0); // drain the queue from audio core without blocking
++        if(mc->reading_client_buffer)
++        return 0;
++        // when last reported free blocks was 0, ping the audio core for more recent data
++        if(!mc->free_streamblocks)
++        {   AXPro_RunCtl(mc->qmain2audio, AXPMCTL_PING);
++            return 0;
++        }
++    }
++    
++    if(size_bytes)
++    {   uint32_t frames = (uint32_t) (size_bytes / (AXPRO_CHANNELS * sizeof(AXProInSample)));
++        if(frames)
++        {   mc->writemsg.write.frame_src = samples;
++            mc->writemsg.write.frame_num = frames;
++            mc->reading_client_buffer = samples;
++            AXPro_RunMsg(mc->qmain2audio, mc->writemsg);
++
++            // when optimization is on we'll let the client wait on fence before writing its buffer again
++            // allowing for more parallel processing of driver and client core
++            #if !AXPRO_IMPLICIT_NONBLOCK_OPTIM
++            axpro_audio_wait_fence(mc, mc->reading_client_buffer);
++            #endif
++
++            return frames;
++        }
++    }
++    return 0;
++}
++
++
++// main driver abstract interface as global data
++audio_driver_t audio_axpro =
++{
++                            axpro_audio_init,
++   (ssize_t (*) (void*, const void*, size_t)) axpro_audio_write,
++   (bool (*) (void*))       axpro_audio_stop,
++   (bool (*) (void*, bool)) axpro_audio_start,
++   (bool (*) (void*))       axpro_audio_alive,
++   (void (*) (void*, bool)) axpro_audio_set_nonblock_state,
++   (void (*) (void*))       axpro_audio_free,
++   (bool (*) (void*))       axpro_audio_use_float,
++                            "AX Pro",
++                            NULL, // optional device_list_new
++                            NULL, // optional device_list_free
++   (size_t (*) (void*))     axpro_audio_write_avail,
++   (size_t (*) (void*))     axpro_audio_buffer_size
++};
++
++
++
++
++// starting and stopping will just install an empty write callback for direct writing mode
++// when using polling mode, direct write must be disabled without slowing it down otherwise
++//----------------------------------------------------------------------------------------------------
++
++static void _axpro_write_empty(AXProAudioCore* ac)  { };
++static ssize_t axpro_audio_write_empty(AXProMainCore* mc, AXProInSample* samples, size_t size_bytes)
++{   // drain the queue so ending poll mode and fence msgs can get through
++    while(OSReceiveMessage(&mc->qaudio2main, (OSMessage*) &mc->msg, OS_MESSAGE_FLAGS_NONE)) 
++        if(mc->msg.Call) mc->msg.Call(mc);
++        else if(mc->msg.ctl.request == AXPMCTL_CLREAD_FENCEREACH)
++        {   mc->free_streamblocks = (uint16_t) mc->msg.ctl.ctlgeneral[0];
++            mc->reading_client_buffer = NULL;
++        }
++        else if(mc->msg.ctl.request == AXPMCTL_PING) 
++            mc->free_streamblocks = (uint16_t) mc->msg.ctl.ctlgeneral[0];
++    return 0;
++}
++
++void axpro_pollmode_begin(AXProMainCore* mc) 
++{   mc->flags |= AXPMCF_POLLMODE; 
++    mc->writemsg.Call = _axpro_write_empty;
++    audio_axpro.write = (ssize_t (*) (void*, const void*, size_t)) axpro_audio_write_empty;
++    mc->reading_client_buffer = NULL;
++}
++
++void axpro_pollmode_end(AXProMainCore* mc) 
++{   mc->flags &= ~AXPMCF_POLLMODE; 
++    mc->writemsg.Call = _axpro_write;
++    audio_axpro.write = (ssize_t (*) (void*, const void*, size_t)) axpro_audio_write;
++}
++
++static bool axpro_audio_stop(AXProMainCore* mc) 
++{   if(!(mc->flags & (AXPMCF_POLLMODE | AXPMCF_STOPPED)))
++    {   mc->flags |= AXPMCF_STOPPED;
++        audio_axpro.write = (ssize_t (*) (void*, const void*, size_t)) axpro_audio_write_empty;
++    }
++    return true;
++}
++
++static bool axpro_audio_start(AXProMainCore* mc, bool is_shutdown)
++{   if((mc->flags & AXPMCF_STOPPED) && !(mc->flags & AXPMCF_POLLMODE))
++    {   mc->flags &= ~AXPMCF_STOPPED;
++        audio_axpro.write = (ssize_t (*) (void*, const void*, size_t)) axpro_audio_write;
++    }
++    return true;
++}
++
++
++// WiiU specific extensions
++//----------------------------------------------------
++
++// in order to parallelize audio processing (float conversion, stereo splitting, audio interfacing) with the main core (which does the emulation)
++// fence should be waited on before writing into buffer last passed to driver write call
++// this needs to be done in RA for WiiU before writing into audio_st->output_samples_buf passed to audio_st->resampler->process(...)
++void axpro_audio_wait_fence(void* context_audio_data, void* client_buffer)
++{
++    AXProMainCore* mc = (AXProMainCore*) context_audio_data;
++    if(mc && client_buffer && mc == gm.mc && mc->reading_client_buffer)
++    {
++        // normally just wait on audio core thread to report it's done with buffer passed to it
++        if(!(mc->flags & AXPMCF_NONBLOCK))
++        {
++            // wait on reading to complete before letting client write into (this) buffer again
++            AXPro_Wait(mc, 0, 
++                if(mc->msg.ctl.request == AXPMCTL_CLREAD_FENCEREACH) 
++                {   mc->free_streamblocks = (uint16_t) mc->msg.ctl.ctlgeneral[0];
++                    goto fence_reached;
++                }
++                else if(mc->msg.ctl.request == AXPMCTL_PING) 
++                    mc->free_streamblocks = (uint16_t) mc->msg.ctl.ctlgeneral[0];
++                ,
++                break);
++            // timeout / error / pollmode begin case
++            fence_reached:
++            mc->reading_client_buffer = NULL;
++        }
++
++        else
++        {   // skip blocking when asked, check our message queue and adjust the internal state
++            // skipping potential explicit fence wait by the core/ra will cause audible noise
++            // data is also dropped by write when in this mode, however it might be acceptable (fast forwarding)
++            axpro_audio_write_empty(mc, NULL, 0);
++        }
++    }
++}
++
++void axpro_audio_wait_fence_core(void* client_buffer) { axpro_audio_wait_fence(gm.mc, client_buffer); }
++
++
++// extension for cores that provide callback for generating audio into given buffer, called from audio core thread
++// when non NULL SampleGenCallback is provided it will get called from driver thread and RA driver write should not be used
++// RA resampler is avoided and emulation core is called directly from audio driver thread
++// scummvm could benefit from this approach
++void axpro_audio_set_thread_callback(AXPRO_GEN_CALLBACK* SampleGenCallback, void* ctx)
++{
++    gm.msg_setcallback.Call = NULL;
++    gm.msg_setcallback.ctl.request = AXPMCTL_CHANGE_SAMPLEGEN;
++    gm.msg_setcallback.ctl.setgen.samplegen_ctx = ctx;
++    gm.msg_setcallback.ctl.setgen.GenerateSamples = SampleGenCallback;
++
++    if(gm.mc && gm.mc->qmain2audio)
++    AXPro_RunMsg(gm.mc->qmain2audio, gm.msg_setcallback);
++
++    audio_axpro.write =  (ssize_t (*) (void*, const void*, size_t)) (SampleGenCallback ? axpro_audio_write_empty : axpro_audio_write);
++}
+diff --git a/audio/drivers/wiiu_audio2.h b/audio/drivers/wiiu_audio2.h
+new file mode 100644
+index 0000000..4bfba7f
+--- /dev/null
++++ b/audio/drivers/wiiu_audio2.h
+@@ -0,0 +1,431 @@
++/*  RetroArch - A frontend for libretro.
++ *  Copyright (C) 2023-2024 - vrda
++ *
++ *  RetroArch is free software: you can redistribute it and/or modify it under the terms
++ *  of the GNU General Public License as published by the Free Software Found-
++ *  ation, either version 3 of the License, or (at your option) any later version.
++ *
++ *  RetroArch is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
++ *  without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
++ *  PURPOSE.  See the GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License along with RetroArch.
++ *  If not, see <http://www.gnu.org/licenses/>.
++ */
++#ifndef WIIU_AUDIO2_H_INCLUDED
++#define WIIU_AUDIO2_H_INCLUDED
++
++// standard includes
++//--------------------------------------
++#include <string.h>
++#include <stdint.h>
++#include <math.h>
++
++
++// build system specifics
++//--------------------------------------
++
++// fcon:change this to real wut build define or just completely remove the Tiramisu RA includes below
++#define WUT_BUILD (!defined(HAVE_IOSUHAX))
++#if WUT_BUILD
++#include <coreinit/thread.h>
++#include <coreinit/messagequeue.h>
++#include <coreinit/time.h>
++#include <coreinit/memdefaultheap.h>
++#include <coreinit/cache.h>
++#include <sndcore2/core.h>
++#include <sndcore2/voice.h>
++
++// wut specific common wrappers
++#define AXPro_MemAlloc(Size, Align)     MEMAllocFromDefaultHeapEx(Size, Align)
++#define AXPro_MemFree(Ptr)              MEMFreeToDefaultHeap(Ptr)
++
++#else
++// build without WUT (current RetroArch build is using devkitPPC r29)
++#include <wiiu/os/thread.h>
++#include <wiiu/os/systeminfo.h>
++#include <wiiu/os/messagequeue.h>
++#include <wiiu/os/cache.h>
++#include <wiiu/ax.h>
++#define OS_MESSAGE_FLAGS_BLOCKING       OS_MESSAGE_QUEUE_BLOCKING
++#define OS_MESSAGE_FLAGS_NONE           ((OSMessageFlags)0)
++#define OSMillisecondsToTicks           OSMilliseconds
++typedef void(*AXFrameCallback) (void);
++AXFrameCallback AXRegisterFrameCallback(AXFrameCallback callback);
++
++// devkitPPC r29 specific common wrappers
++#define AXPro_MemAlloc(Size, Align)     MEM2_alloc(Size, Align)
++#define AXPro_MemFree(Ptr)              MEM2_free(Ptr)
++#endif // non WUT build
++
++
++// common (wut also) missing definitions  // fcon:aroma - check where should this go
++extern uint32_t LCEnableDMA();
++//extern void LCDisableDMA();
++extern void* LCAlloc(uint32_t bytes);
++extern void LCDealloc(void* p);
++extern void LCStoreDMABlocks(void* destMem, const void* srcLC, uint32_t cache_lines);
++
++// RA includes
++#include "../../wiiu/system/memory.h"
++#include "../audio_driver.h"
++
++
++// compile time configuration
++//--------------------------------------
++#define AXPRO_CORE_AUDIO                0   // coreid we will use for audio processing  (1 is by default the "main" core, 0 and 2 are available)
++
++#define AXPRO_CACHELINE_SIZE            32  // these are pretty much set in stone
++#define AXPRO_CACHEFETCH_SIZE           64
++#define AXPRO_SAMPLEBUFF_ALIGNMENT      64
++#define AXPRO_LCACHE_ALIGNMENT          512
++#define AXPRO_INTERRUPT_INTERVAL_MS     3
++#define AXPRO_SAMPLE_BYTES              2
++#define AXPRO_CHANNELS                  2
++#define AXPRO_VOICE_FORMAT              AX_VOICE_FORMAT_LPCM16
++#define AXPRO_CLINES4FRAMES(Frames)     ((Frames) >> 3)  // (frames * AXPRO_CHANNELS * AXPRO_SAMPLE_BYTES) / AXPRO_CACHELINE_SIZE
++#define AXPRO_MINBLOCKS_FOR_PLAY        2
++
++#define AXPRO_MAX_MSGS_AUDIO2MAIN       16  // message queue sizes, irq ones might need to be adjusted dynamically to support max number of blocks and some more msgs for control msgs
++#define AXPRO_MAX_MSGS_MAIN2AUDIO       32
++#define AXPRO_MAX_MSGS_MAIN2IRQ         16
++#define AXPRO_MAX_MSGS_AUDIO2IRQ        64
++#define AXPRO_MAX_MSGS_IRQ2AUDIO        AXPRO_MAX_MSGS_AUDIO2IRQ
++
++#define AXPRO_INIT_RENDERER             AX_INIT_RENDERER_48KHZ      // AX_INIT_RENDERER_48KHZ or AX_INIT_RENDERER_32KHZ
++#define AXPRO_SAMPLE_RATE               48000                       // 48000 or 32000
++#define AXPRO_INIT_PIPELINE             AX_INIT_PIPELINE_FOUR_STAGE // AX_INIT_PIPELINE_SINGLE or AX_INIT_PIPELINE_FOUR_STAGE
++#define AXPRO_INIT_RESAMPLER            AX_VOICE_SRC_TYPE_LINEAR    // 0=none, 1=linear, 2=AX_VOICE_SRC_TYPE_UNK0, 3=unk1, 4=unk2
++#define AXPRO_VOICE_PRIORITY            31                          // 31=max priority
++#define AXPRO_POLL_LOWPOWER_TIMEOUT     1000                        // in AXPRO_INTERRUPT_INTERVAL_MS units (1000 = 3 seconds)
++
++
++// streamblock size in interrupt time durations
++// minimum granularity and latency, we need two streamblocks filled before playing
++// so minimum latency is 1=1*2*3ms=6ms (unstable)  2=2*2*3ms=12ms  3=18ms and so on
++#define AXPRO_STREAMBLOCK_INTERRUPTS    2
++
++// streamblocks in locked cache
++// must not be smaller than 2 for polling path to work (axpro_audio_set_thread_callback)
++// for normal RA it must hold blocks as defined below (round up to next integer)
++// (AUDIO_CHUNK_SIZE_NONBLOCKING * 500 / sample_rate) / (AXPRO_STREAMBLOCK_INTERRUPTS * AXPRO_INTERRUPT_INTERVAL_MS)
++#define AXPRO_STREAMBLOCKS_LC           3
++
++// very simple rate control
++// can help smooth out underruns and maintain continuous playback when input is tiny bit slower than output
++#define AXPRO_RATE_CONTROL_AMORTIZER    1
++#define AXPRO_RATE_LOW                  100.0f  // Hz lower than requested rate
++#define AXPRO_RATE_LOWER                200.0f  // Hz lower than requested rate
++#define AXPRO_RATE_DURATION_NORMAL      0.5f    // seconds at least in normal rate state
++#define AXPRO_RATE_DURATION_LOW         0.05f   // seconds at least in lower rate states
++
++
++// RA/core integration optimization setup
++#ifndef WIIU_AUDIO_OPTIMIZATION_LEVEL
++#define WIIU_AUDIO_OPTIMIZATION_LEVEL 0     // optimization level should come defined as RA build switch
++#endif
++
++#if WIIU_AUDIO_OPTIMIZATION_LEVEL == 0      // default - full RA options supported, no changes needed in RA or core code
++#define AXPRO_ACCEPTS_FLOAT_SAMPLES     1   // take the float conversion off the main thread 
++#define AXPRO_IMPLICIT_NONBLOCK_OPTIM   0   // wait in write until we read all the client data
++
++#elif WIIU_AUDIO_OPTIMIZATION_LEVEL == 1    // lite optimization - full RA options supported, lite changes needed in RA code
++#define AXPRO_ACCEPTS_FLOAT_SAMPLES     1   // take the float conversion off the main thread 
++#define AXPRO_IMPLICIT_NONBLOCK_OPTIM   1   // RA will call axpro_audio_wait_fence before writing into memory passed to previous write call
++
++#elif WIIU_AUDIO_OPTIMIZATION_LEVEL == 2    // fast direct int16 - no RA options like FF, record, rate control, etc. Changes RA to avoid parts of audio pipeline
++#define AXPRO_ACCEPTS_FLOAT_SAMPLES     0   // we're working with int16
++#define AXPRO_IMPLICIT_NONBLOCK_OPTIM   0   // wait in write until we read all the client data
++
++#elif WIIU_AUDIO_OPTIMIZATION_LEVEL == 3    // custom core mode - no RA options like FF, record, rate control, etc. Changes RA to avoid parts of audio pipeline. Core changes needed.
++#define AXPRO_ACCEPTS_FLOAT_SAMPLES     0   // we're working with int16
++#define AXPRO_IMPLICIT_NONBLOCK_OPTIM   1   // core will call axpro_audio_wait_fence before writing into memory passed to previous write call or will not use write call by using axpro_audio_set_thread_callback
++#endif
++
++
++// common utils
++//--------------------------------------
++#ifdef _MSC_VER
++#define AXPRO_ALIGNED_DECLARE(Declaration, AlignBytes) __declspec(align(AlignBytes)) Declaration
++#else
++#define AXPRO_ALIGNED_DECLARE(Declaration, AlignBytes) Declaration __attribute__((aligned(AlignBytes)))
++#endif
++#define AXPRO_ALIGNED_DECLARE_CLINE1(Declaration) AXPRO_ALIGNED_DECLARE(Declaration, AXPRO_CACHELINE_SIZE)
++#define AXPRO_ALIGNED_DECLARE_CLINE2(Declaration) AXPRO_ALIGNED_DECLARE(Declaration, AXPRO_CACHEFETCH_SIZE)
++#define AXPRO_ALIGN_SIZE(_v, _s) _v += (_v & (_s-1)) ? _s - (_v & (_s-1)) : 0
++
++#define AXPro_RunMsg(Queue, MsgRef)                                         \
++    OSSendMessage(Queue, (OSMessage*)(&MsgRef), OS_MESSAGE_FLAGS_BLOCKING)
++
++#define AXPro_RunCtlEx(Queue, Request, CtlData, MsgFlags)       \
++{   AXPRO_ALIGNED_DECLARE_CLINE1(OSMessage msg);                \
++    msg.message = NULL;                                         \
++    ((AXProMsgCtlPart*)msg.args)->request = Request;            \
++    ((AXProMsgCtlPart*)msg.args)->ctlgeneral[0] = CtlData;      \
++    OSSendMessage(Queue, &msg, MsgFlags);                       \
++}
++#define AXPro_RunCtl(Queue, Request) AXPro_RunCtlEx(Queue, Request, AXPINGF_NONE, OS_MESSAGE_FLAGS_BLOCKING)
++#define AXPro_PostCtl(Queue, Request) AXPro_RunCtlEx(Queue, Request, AXPINGF_NONE, OS_MESSAGE_FLAGS_NONE)
++
++#define AXPro_Run(Queue, Call)                      \
++{   AXPRO_ALIGNED_DECLARE_CLINE1(OSMessage msg);    \
++    msg.message = (void*) (Call);                   \
++    AXPro_RunMsg(Queue, msg);                       \
++}
++
++#define AXPro_Wait(CoreData, WaitCond, OnCtlMsg, OnError)               \
++{   while(!(WaitCond))                                                  \
++        if(OSReceiveMessage((OSMessageQueue*) (CoreData),               \
++                            (OSMessage*)&((CoreData)->msg),             \
++                            OS_MESSAGE_FLAGS_BLOCKING))                 \
++        {   if((CoreData)->msg.Call) (CoreData)->msg.Call(CoreData);    \
++            else { OnCtlMsg; };                                         \
++        }                                                               \
++        else { OnError; };                                              \
++}
++
++
++// common types and defines
++//--------------------------------------
++typedef struct AXProMainCore AXProMainCore;
++typedef struct AXProAudioCore AXProAudioCore;
++typedef void (AXPRO_PROCAUDIO) (AXProAudioCore* ac);
++typedef void (AXPRO_PROCMAIN) (AXProMainCore* mc);
++
++// samplegen callback types - returns number of frames (samples for L and R channels) written
++typedef int32_t (AXPRO_GEN_CALLBACK) (void* ctx, int16_t* samples, uint32_t len_bytes);
++typedef struct AXProSampleGenData
++{
++    void*               samplegen_ctx;
++    AXPRO_GEN_CALLBACK* GenerateSamples;
++
++} AXProSampleGenData;
++
++#if AXPRO_ACCEPTS_FLOAT_SAMPLES
++typedef float AXProInSample;
++#else
++typedef int16_t AXProInSample;
++#endif
++
++// control message ids
++#define AXPMCTL_QUIT                    1
++#define AXPMCTL_CHANGE_SAMPLEGEN        2
++#define AXPMCTL_ERROR_INIT              3
++#define AXPMCTL_BLOCK_READY             4
++#define AXPMCTL_BLOCK_PLAYED            5
++#define AXPMCTL_PING                    6
++#define AXPMCTL_CLREAD_FENCEREACH       7
++
++// ping piggybacking subcommands
++#define AXPINGF_NONE                    0x00
++#define AXPINGF_SET                     0x40
++#define AXPINGF_RESET                   0x80
++
++// interrupt handler state
++#define AXPACS_STOPPED                  0
++#define AXPACS_BUFFERING_BEFORE_PLAY    1
++#define AXPACS_PLAYING                  2
++#define AXPACS_STOPPING                 3
++
++// main core flags
++#define AXPMCF_HW_READY                 0x01
++#define AXPMCF_HW_CLOSED                0x02
++#define AXPMCF_POLLMODE                 0x04
++#define AXPMCF_STOPPED                  0x08
++#define AXPMCF_NONBLOCK                 0x10
++
++// interrupt handler flags
++#define AXPIHF_POLLMODE                 0x01
++
++// audio core flags
++#define AXPACF_STOPPED_LONGAGO          0x01
++
++
++// message types
++//--------------------------------------
++
++typedef struct AXProMsgCtlPart
++{
++    uint8_t             request;            // AXPMCTL_...
++    uint8_t             _res1b[3];
++    union {
++    AXProSampleGenData  setgen;
++    uint32_t            pingreqiest;        // AXPIHF_...
++    uint32_t            ctlgeneral[2];
++    };
++} AXProMsgCtlPart;
++
++
++typedef struct AXProMsgAudio2Main
++{
++    AXPRO_PROCMAIN*         Call;
++    union
++    {   AXProMsgCtlPart     ctl;
++        struct
++        {   AXProAudioCore* ac;
++            OSMessageQueue* q2audio;
++            OSMessageQueue* q2irq;
++        } ready;
++        struct
++        {   uint16_t        streamblocks;
++        } hwready;
++        uint32_t            general_args[3];
++    }; // union
++
++} AXProMsgAudio2Main;
++
++typedef struct AXProMsgMain2Audio
++{
++    AXPRO_PROCAUDIO*        Call;
++    union
++    {   AXProMsgCtlPart     ctl;
++        struct
++        {   uint32_t        rate;
++            uint32_t        latency;
++        } init;
++        struct
++        {   AXProInSample*  frame_src;
++            uint32_t        frame_num;
++        } write;
++        uint32_t            general_args[3];
++    }; // union
++
++} AXProMsgMain2Audio;
++
++
++
++// interrupt handler data, kept in separate cache lines
++
++typedef struct AXProFrameCallbackData
++{
++//----  // read/write cache line
++    uint8_t                     state;          // AXPACS_...
++    uint8_t                     flags;          // AXPIHF_...
++    uint16_t                    playing_blockid;
++    uint32_t                    prev_loopcount;
++    uint32_t                    prepared_streamblocks;
++
++    uint16_t                    stopped_state_duration;
++    
++    uint16_t                    rate_idx_set;
++    uint16_t                    rate_change_timeout;
++    uint16_t                    _resw1;
++    float                       rate_src_ratios[3];
++//---   // read only cache line
++    AXVoice*                    voice_l;
++    AXVoice*                    voice_r;
++
++    uint16_t                    streamblock_frames;
++    uint16_t                    streamblocks;
++
++    uint16_t                    streamblock_samples;
++    uint16_t                    frames_per_interrupt;
++
++    int16_t*                    voicebuff_l;
++    AXFrameCallback             prev_ax_framecallback;
++
++    uint16_t                    rate_blocks_hi;
++    uint16_t                    rate_blocks_low;
++
++    uint16_t                    rate_change_timeout_normal;
++    uint16_t                    rate_change_timeout_slow;
++//----
++
++} AXProFrameCallbackData;
++
++
++
++// front core data
++//--------------------------------------
++typedef struct AXProMainCore
++{
++//----
++    OSMessageQueue              qaudio2main;
++    OSMessageQueue*             qmain2audio;
++//----
++    OSMessage                   msgstore_audio2main[AXPRO_MAX_MSGS_AUDIO2MAIN];
++//----
++    AXProMsgAudio2Main          msg;
++    AXProMsgMain2Audio          writemsg;
++//---
++    OSMessageQueue*             qmain2irq;
++    uint32_t                    flags;      // AXPMCF_...
++    AXProAudioCore*             ac;         // main core should only pass it as callback context to be used from audio core
++    void*                       reading_client_buffer;
++//--
++    uint16_t                    free_streamblocks;
++    uint16_t                    total_streamblocks;
++    uint32_t                    _resu1[3];
++//---
++
++} AXProMainCore;
++
++
++
++
++// audio core data
++//--------------------------------------
++typedef struct AXProAudioCore
++{
++//----
++    OSMessageQueue              qmain2audio;
++    OSMessageQueue*             qaudio2main;
++//----
++    OSMessage                   msgstore_main2audio[AXPRO_MAX_MSGS_MAIN2AUDIO];
++//----
++    AXProFrameCallbackData      interrupt_data;
++//----  // read/write data
++    AXProMsgMain2Audio          msg;
++//--
++    uint16_t                    lc_missing_block_frames;    // frames missing to fill the current block
++    uint16_t                    voicebuff_free_blocks;
++    int16_t*                    lc_block_writepos;
++    int16_t*                    lc_block_base;
++    int16_t*                    voicebuff_writeblock;
++//---   // read only data
++    uint16_t                    streamblock_frames;
++    uint16_t                    streamblocks;
++    int16_t*                    voicebuff;
++    int16_t*                    lc_base;
++    int16_t*                    lc_base_circular;
++//--
++    int16_t*                    lc_last_block;
++    int16_t*                    voicebuff_last_block;
++    uint32_t                    streamblock_bytes;
++    uint32_t                    streamblock_channel_bytes;
++//---
++//----  // read/write queue shared data
++    AXPRO_ALIGNED_DECLARE_CLINE2(OSMessageQueue qirq2audio);
++    void*                       _resp2;
++//----
++    OSMessage                   msgstore_irq2audio[AXPRO_MAX_MSGS_IRQ2AUDIO];
++//----
++    OSMessageQueue              qaudio2irq;
++    void*                       _resp3;
++//----
++    OSMessage                   msgstorage_audio2irq[AXPRO_MAX_MSGS_AUDIO2IRQ];
++//----
++    OSMessageQueue              qmain2irq;
++    void*                       _resp4;
++//----
++    OSMessage                   msgstorage_main2irq[AXPRO_MAX_MSGS_MAIN2IRQ];
++//----
++} AXProAudioCore;
++
++
++// WiiU specific extensions
++
++// in order to parallelize audio processing (float conversion, stereo splitting, audio interfacing) with the main core (which does the emulation)
++// fence should be waited on before writing into buffer last passed to driver write call
++// this can be done for example in RA for WiiU before writing into audio_st->output_samples_buf passed to audio_st->resampler->process(...)
++void axpro_audio_wait_fence(void* context_audio_data, void* client_buffer);
++void axpro_audio_wait_fence_core(void* client_buffer);
++
++
++// extension for cores that provide callback for generating audio into given buffer, called from audio core thread
++// when non NULL SampleGenCallback is provided it will get called from driver thread and RA driver write should not be used
++// RA resampler is avoided and emulation core is called directly from audio driver thread
++// scummvm could benefit from this approach
++void axpro_audio_set_thread_callback(AXPRO_GEN_CALLBACK* SampleGenCallback, void* ctx);
++
++#endif
+diff --git a/audio/drivers/wiiu_audio2_core.c b/audio/drivers/wiiu_audio2_core.c
+new file mode 100644
+index 0000000..e33a814
+--- /dev/null
++++ b/audio/drivers/wiiu_audio2_core.c
+@@ -0,0 +1,485 @@
++/*  RetroArch - A frontend for libretro.
++ *  Copyright (C) 2023-2024 - vrda
++ *
++ *  RetroArch is free software: you can redistribute it and/or modify it under the terms
++ *  of the GNU General Public License as published by the Free Software Found-
++ *  ation, either version 3 of the License, or (at your option) any later version.
++ *
++ *  RetroArch is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
++ *  without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
++ *  PURPOSE.  See the GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License along with RetroArch.
++ *  If not, see <http://www.gnu.org/licenses/>.
++ */
++#include "wiiu_audio2.h"
++
++
++// just couldn't resist using global data, at least separate the cache lines
++typedef struct GlobalDataAudioCore
++{   AXProAudioCore*         ac;
++    uint32_t                unusedu[7];
++//---
++
++} GlobalDataAudioCore; AXPRO_ALIGNED_DECLARE_CLINE2(GlobalDataAudioCore ga);
++
++
++
++// interrupt handler
++//----------------------------------------------------
++
++static inline void _axpro_continue_playing(AXProFrameCallbackData* idat)
++{   AXSetVoiceState(idat->voice_l, AX_VOICE_STATE_PLAYING);
++    AXSetVoiceState(idat->voice_r, AX_VOICE_STATE_PLAYING);
++}
++
++static inline void _axpro_stop_playing(AXProFrameCallbackData* idat)
++{   AXSetVoiceState(idat->voice_l, AX_VOICE_STATE_STOPPED);
++    AXSetVoiceState(idat->voice_r, AX_VOICE_STATE_STOPPED);
++}
++
++static inline void _axpro_begin_playing(AXProFrameCallbackData* idat)
++{   //print_irq("bufferred %d blocks, starting play\n", idat->prepared_streamblocks);
++    idat->prev_loopcount = AXGetVoiceLoopCount(idat->voice_l);
++    _axpro_continue_playing(idat);
++    // fcon: what about fade in ?
++}
++
++
++// adjust the rate to keep the playback continuous rather than doing short stops
++#if AXPRO_RATE_CONTROL_AMORTIZER
++static inline void _axpro_adjust_rate_control(AXProFrameCallbackData* idat, uint32_t prepared_streamblocks)
++{
++    uint16_t rate_change_timeout = idat->rate_change_timeout;
++    if(!rate_change_timeout)
++    {
++        switch(idat->rate_idx_set)
++        {   case 0:
++                if(prepared_streamblocks < idat->rate_blocks_hi) { idat->rate_idx_set = 1; idat->rate_change_timeout = idat->rate_change_timeout_slow; }
++                else return;
++                break;
++
++            case 1:
++                if(prepared_streamblocks > idat->rate_blocks_hi) { idat->rate_idx_set = 0; idat->rate_change_timeout = idat->rate_change_timeout_normal; }
++                else if(prepared_streamblocks < idat->rate_blocks_low) { idat->rate_idx_set = 2; idat->rate_change_timeout = idat->rate_change_timeout_slow; }
++                else return;
++                break;
++
++            case 2:
++                if(prepared_streamblocks >= idat->rate_blocks_low) { idat->rate_idx_set = 1; idat->rate_change_timeout = idat->rate_change_timeout_slow; }
++                else return;
++                break;
++        }
++        //uint16_t current_rate_idx = (prepared_streamblocks > idat->rate_blocks_hi) ? 0 : ((prepared_streamblocks < idat->rate_blocks_low) ? 2 : 1);
++        //print_irq("rate change to %d (%.3f)\n", idat->rate_idx_set, idat->rate_src_ratios[idat->rate_idx_set]);
++        float new_ratio = idat->rate_src_ratios[idat->rate_idx_set];
++        AXSetVoiceSrcRatio(idat->voice_l, new_ratio);
++        AXSetVoiceSrcRatio(idat->voice_r, new_ratio);
++    }
++    else idat->rate_change_timeout = rate_change_timeout - 1;
++}
++#else
++#define _axpro_adjust_rate_control(Idat, PreparedStreamblocks)
++#endif
++
++
++void axpro_audioframe_callback()
++{
++    // just skip the interrupt handler when interlocked and when init is not complete
++    AXPRO_ALIGNED_DECLARE_CLINE1(AXProMsgMain2Audio msg);
++    AXProAudioCore* _ac = ga.ac;
++    if(!_ac || !_ac->interrupt_data.voice_l) return;
++    //if(ac->prev_ax_framecallback) ac->prev_ax_framecallback(); // not really needed here
++    AXProFrameCallbackData* idat = &_ac->interrupt_data;
++
++    // check control msgs from main
++    while(OSReceiveMessage(&_ac->qmain2irq, (OSMessage*) &msg, OS_MESSAGE_FLAGS_NONE))
++        //if(!msg.Call)
++        switch(msg.ctl.request)
++        {   case AXPMCTL_QUIT:
++                // stop voices with fade out, maybe even go into stopping state ?
++                _axpro_stop_playing(idat);
++                // wake up audio thread if needed with quit msg
++                AXPro_RunMsg(&_ac->qirq2audio, msg);
++                ga.ac = NULL;
++                return;
++        }
++
++    // see if any new blocks are provided to us
++    uint32_t prepared_streamblocks = idat->prepared_streamblocks;
++    while(OSReceiveMessage(&_ac->qaudio2irq, (OSMessage*) &msg, OS_MESSAGE_FLAGS_NONE))
++        //if(!msg.Call)
++        switch(msg.ctl.request)
++        {
++            case AXPMCTL_BLOCK_READY:
++                ++prepared_streamblocks;
++                idat->prepared_streamblocks = prepared_streamblocks;
++                break;
++
++            case AXPMCTL_PING:
++                if(msg.ctl.pingreqiest & AXPINGF_SET) idat->flags |= (msg.ctl.pingreqiest & ~AXPINGF_SET);
++                else if(msg.ctl.pingreqiest & AXPINGF_RESET) idat->flags &= ~(msg.ctl.pingreqiest & ~AXPINGF_RESET);
++                AXPro_PostCtl(&_ac->qirq2audio, AXPMCTL_PING);
++                break;
++        }
++
++    // help out the polling mode loop with timing
++    // notify when not playing for a long time so audio core can do a blocking wait queue from us
++    if(idat->state < AXPACS_PLAYING && idat->flags & AXPIHF_POLLMODE) // AXPACS_STOPPED and AXPACS_BUFFERING_BEFORE_PLAY
++    {   uint16_t stopped_state_ticks = idat->stopped_state_duration + 1;
++        if(stopped_state_ticks < AXPRO_POLL_LOWPOWER_TIMEOUT) idat->stopped_state_duration = stopped_state_ticks;
++        else if(stopped_state_ticks > AXPRO_POLL_LOWPOWER_TIMEOUT)
++        AXPro_PostCtl(&_ac->qirq2audio, AXPMCTL_PING)
++        else
++        {   idat->stopped_state_duration = stopped_state_ticks;
++            AXPro_RunCtlEx(&_ac->qirq2audio, AXPMCTL_PING, AXPINGF_SET | AXPACF_STOPPED_LONGAGO, OS_MESSAGE_FLAGS_NONE);
++        }
++    }
++
++    // adjust the AX renderer and our state
++    switch(idat->state)
++    {
++        case AXPACS_STOPPED:
++            if(prepared_streamblocks)
++            idat->state = AXPACS_BUFFERING_BEFORE_PLAY;
++            else break;
++
++        case AXPACS_BUFFERING_BEFORE_PLAY:
++            if(prepared_streamblocks >= AXPRO_MINBLOCKS_FOR_PLAY)
++            {
++                idat->state = AXPACS_PLAYING;
++                if(idat->stopped_state_duration) 
++                {   idat->stopped_state_duration = 0;
++                    AXPro_RunCtlEx(&_ac->qirq2audio, AXPMCTL_PING, AXPINGF_RESET | AXPACF_STOPPED_LONGAGO, OS_MESSAGE_FLAGS_NONE);
++                }
++                _axpro_begin_playing(idat);
++            }
++            break;
++
++        case AXPACS_PLAYING:
++        {   uint32_t loop_count = AXGetVoiceLoopCount(idat->voice_l);
++
++            // our playing blockid changed, one full streamblock has been played, next one is playing now
++            if(idat->prev_loopcount != loop_count)
++            {
++                // one streamblock has been played
++                _axpro_adjust_rate_control(idat, prepared_streamblocks);
++                uint16_t playing_blockid = idat->playing_blockid;
++                idat->prev_loopcount = loop_count;
++                if(++playing_blockid == idat->streamblocks)
++                playing_blockid = 0;
++                idat->prepared_streamblocks = --prepared_streamblocks;
++                idat->playing_blockid = playing_blockid;
++                //print_irq("  playing_blockid=%d, prepared=%d\n", idat->playing_blockid, prepared_streamblocks);
++
++                // calculate helpers for adjusting loop and end offsets
++                uint32_t playing_sampleidx = playing_blockid * idat->streamblock_samples;
++                uint16_t next_playing_blockid = playing_blockid + 1;
++
++                // adjust correct loop and end offsets for continuous play case
++                uint32_t end_offset = playing_sampleidx + idat->streamblock_frames - 1;
++                uint32_t loop_offset = (next_playing_blockid < idat->streamblocks) ?
++                        next_playing_blockid * idat->streamblock_samples :
++                        0;
++
++                // must go into stopping state - no two blocks ready for just letting it play with loop jump in play state
++                if(prepared_streamblocks < 2)
++                idat->state = AXPACS_STOPPING;
++
++                // apply the loop and end offsets and either continue in play or stopping state
++                AXSetVoiceLoopOffset(idat->voice_l, loop_offset);
++                AXSetVoiceEndOffset(idat->voice_l, end_offset);
++                AXSetVoiceLoopOffset(idat->voice_r, loop_offset);
++                AXSetVoiceEndOffset(idat->voice_r, end_offset);
++
++                // publish the played block to audio core
++                AXPro_PostCtl(&_ac->qirq2audio, AXPMCTL_BLOCK_PLAYED);
++            } // loop triggered - one streamblock played, next one started
++        }
++        break;
++
++
++        case AXPACS_STOPPING:
++        {   uint32_t loop_count = AXGetVoiceLoopCount(idat->voice_l);
++
++            // our playing blockid changed, one full streamblock has been played, next one is playing now
++            if(idat->prev_loopcount != loop_count)
++            {
++                // one streamblock has been played
++                _axpro_adjust_rate_control(idat, prepared_streamblocks);
++                uint16_t playing_blockid = idat->playing_blockid;
++                idat->prev_loopcount = loop_count;
++                if(++playing_blockid == idat->streamblocks)
++                playing_blockid = 0;
++                idat->prepared_streamblocks = --prepared_streamblocks;
++                idat->playing_blockid = playing_blockid;
++                //print_irq("  stopping_blockid=%d, prepared=%d\n", idat->playing_blockid, prepared_streamblocks);
++
++                // calculate helpers for adjusting loop and end offsets
++                uint32_t playing_sampleidx = playing_blockid * idat->streamblock_samples;
++                uint16_t next_playing_blockid = playing_blockid + 1;
++
++                // adjust correct loop and end offsets for continuous play case
++                uint32_t end_offset = playing_sampleidx + idat->streamblock_frames - 1;
++                uint32_t loop_offset = (next_playing_blockid < idat->streamblocks) ?
++                        next_playing_blockid * idat->streamblock_samples :
++                        0;
++
++                if(prepared_streamblocks)
++                {
++                    if(prepared_streamblocks > 1)
++                    idat->state = AXPACS_PLAYING;
++
++                    // apply the loop and end offsets and either continue in play or stopping state
++                    AXSetVoiceLoopOffset(idat->voice_l, loop_offset);
++                    AXSetVoiceEndOffset(idat->voice_l, end_offset);
++                    AXSetVoiceLoopOffset(idat->voice_r, loop_offset);
++                    AXSetVoiceEndOffset(idat->voice_r, end_offset);
++                }
++                else
++                {   idat->state = AXPACS_STOPPED;
++                    AXVoiceOffsets offsets;
++                    offsets.dataType        = AXPRO_VOICE_FORMAT;
++                    offsets.loopingEnabled  = 1;
++                    offsets.loopOffset      = loop_offset;
++                    offsets.endOffset       = end_offset;
++                    offsets.currentOffset   = playing_sampleidx;
++                    offsets.data            = idat->voicebuff_l;
++                    _axpro_stop_playing(idat);
++                    AXSetVoiceOffsets(idat->voice_l, &offsets);
++                    offsets.data            = &idat->voicebuff_l[idat->streamblock_frames];
++                    AXSetVoiceOffsets(idat->voice_r, &offsets);
++                }
++
++                // publish the played block to audio core
++                AXPro_PostCtl(&_ac->qirq2audio, AXPMCTL_BLOCK_PLAYED);
++            } // loop triggered - one streamblock played, next one started
++
++            else
++            {
++                if(prepared_streamblocks > 1)
++                idat->state = AXPACS_PLAYING;
++            }
++        }
++        break;
++    };
++
++    // fcon:update mixer for fades to work
++}
++
++
++
++// audio core thread main
++//----------------------------------------------------
++
++void axpro_close_hw(AXProAudioCore* ac);
++void axpro_hw_closed(AXProMainCore* mc);
++void axpro_polling_loop(AXProAudioCore* ac, void* gen_samples_ctx, AXPRO_GEN_CALLBACK* GenerateSamples);
++
++static void axpro_thread_ready(AXProMainCore* mc)
++{   mc->qmain2audio = mc->msg.ready.q2audio;
++    mc->qmain2irq = mc->msg.ready.q2irq;
++    mc->ac = mc->msg.ready.ac;
++}
++
++// audio core thread "main"
++int axpro_core_main(int args, OSMessageQueue* q2main)
++{
++    // prepare audio core model and link with main core
++    AXProAudioCore* ac;
++    {   uint32_t audio_core_data_sizeof = sizeof(AXProAudioCore); AXPRO_ALIGN_SIZE(audio_core_data_sizeof, AXPRO_CACHEFETCH_SIZE);
++        ac = ga.ac = (AXProAudioCore*) AXPro_MemAlloc(audio_core_data_sizeof, AXPRO_CACHEFETCH_SIZE);
++    }
++    DCZeroRange(ac, sizeof(AXProAudioCore));
++    memset(ac, 0, sizeof(AXProAudioCore));
++    //axpdebug_loginit(&ga.debug);
++
++    ac->qaudio2main = q2main;
++    OSInitMessageQueue(&ac->qmain2audio, ac->msgstore_main2audio, AXPRO_MAX_MSGS_MAIN2AUDIO);
++    AXProMsgAudio2Main ready_msg; ready_msg.Call = axpro_thread_ready; 
++    ready_msg.ready.ac = ac; ready_msg.ready.q2audio = &ac->qmain2audio; ready_msg.ready.q2irq = &ac->qmain2irq; 
++    AXPro_RunMsg(q2main, ready_msg);
++
++    // init main core --> interrupt handler <---> audio core message queues
++    OSInitMessageQueue(&ac->qirq2audio, ac->msgstore_irq2audio, AXPRO_MAX_MSGS_IRQ2AUDIO);
++    OSInitMessageQueue(&ac->qaudio2irq, ac->msgstorage_audio2irq, AXPRO_MAX_MSGS_AUDIO2IRQ);
++    OSInitMessageQueue(&ac->qmain2irq, ac->msgstorage_main2irq, AXPRO_MAX_MSGS_MAIN2IRQ);
++
++    // blocking drain the message queue until quit signal
++    while(OSReceiveMessage(&ac->qmain2audio, (OSMessage*)&ac->msg, OS_MESSAGE_FLAGS_BLOCKING))
++        if(ac->msg.Call) ac->msg.Call(ac);
++        else
++        {   checkctl:
++            if(ac->msg.ctl.request==AXPMCTL_QUIT) break;
++            else if(ac->msg.ctl.request==AXPMCTL_CHANGE_SAMPLEGEN)
++            {   if(ac->msg.ctl.setgen.GenerateSamples) 
++                {   axpro_polling_loop(ac, ac->msg.ctl.setgen.samplegen_ctx, ac->msg.ctl.setgen.GenerateSamples);
++                    goto checkctl;
++                }
++            }
++            
++            // respond to main core with fresh free blocks when pinging us
++            else if(ac->msg.ctl.request==AXPMCTL_PING)
++            {
++                uint32_t free_blocks = ac->voicebuff_free_blocks;
++                while(OSReceiveMessage(&ac->qirq2audio, (OSMessage*)&ac->msg, OS_MESSAGE_FLAGS_NONE))
++                //if(!ac->msg.Call)
++                {   if(ac->msg.ctl.request==AXPMCTL_BLOCK_PLAYED) ++free_blocks;
++                    else goto checkctl;
++                }
++                ac->voicebuff_free_blocks = free_blocks;
++                AXPro_RunCtlEx(ac->qaudio2main, AXPMCTL_PING, free_blocks, OS_MESSAGE_FLAGS_BLOCKING);
++            }
++        }
++
++    // cleanup and quit
++    ga.ac = NULL;
++    axpro_close_hw(ac);
++    //axpdebug_logclose(&ga.debug);
++
++    AXPro_MemFree(ac);
++    AXPro_Run(q2main, axpro_hw_closed);
++    return 0;
++}
++
++
++
++// sound rendering into circular buffers
++//----------------------------------------------------
++
++void _axpro_split_stereo_int16_naive(int16_t* dest_left, int16_t* stereo, int32_t channel_byte_offset, uint32_t stereo_frames)
++{   int16_t* dest_right = (int16_t*) ((uint8_t*)dest_left + channel_byte_offset);
++    do
++    {   *dest_left++ = *stereo++;
++        *dest_right++ = *stereo++;
++    } while(--stereo_frames);
++}
++
++#if AXPRO_ACCEPTS_FLOAT_SAMPLES
++static void _axpro_split_stereo_float32_naive(int16_t* dest_left, float* stereo, int32_t channel_byte_offset, uint32_t stereo_frames)
++{   int16_t* dest_right = (int16_t*) ((uint8_t*)dest_left + channel_byte_offset);
++    do
++    {   int stereo_l = (int) (*stereo++ * 32768.0f);
++        int stereo_r = (int) (*stereo++ * 32768.0f);
++        if(stereo_l > 32767) stereo_l = 32767;
++        if(stereo_r > 32767) stereo_r = 32767;
++        if(stereo_l < -32768) stereo_l = -32768;
++        if(stereo_r < -32768) stereo_r = -32768;
++        *dest_left++ = (int16_t) stereo_l;
++        *dest_right++ = (int16_t) stereo_r;
++    } while(--stereo_frames);
++}
++#endif
++
++void _axpro_upload_and_publish_block(AXProAudioCore* ac, int16_t* block_base)
++{
++    // this is a blocking call, we can immediately publish block ready
++    LCStoreDMABlocks(ac->voicebuff_writeblock, block_base, AXPRO_CLINES4FRAMES(ac->streamblock_frames));
++    AXPro_RunCtl(&ac->qaudio2irq, AXPMCTL_BLOCK_READY);
++    
++    if(ac->voicebuff_writeblock < ac->voicebuff_last_block)
++    ac->voicebuff_writeblock = (int16_t*) ((uint8_t*)ac->voicebuff_writeblock + ac->streamblock_bytes);
++    else ac->voicebuff_writeblock = ac->voicebuff;
++}
++
++
++int16_t* _axpro_finish_lc_writeblock_and_start_new(AXProAudioCore* ac)
++{
++    int16_t* block_base = ac->lc_block_base;
++    if(block_base < ac->lc_last_block)
++    {   block_base += ac->streamblock_frames * AXPRO_CHANNELS;
++        //ac->lc_missing_block_frames = ac->streamblock_frames;
++        //ac->lc_block_writepos = block_base;
++        ac->lc_block_base = block_base;
++        return block_base;
++    }
++    else
++    {   //ac->lc_missing_block_frames = ac->streamblock_frames;
++        //ac->lc_block_writepos = ac->lc_base_circular;
++        ac->lc_block_base = ac->lc_base_circular;
++        return ac->lc_base_circular;
++    }
++}
++
++
++
++// non-polling writing (default RA)
++//----------------------------------------------------
++
++
++void _axpro_write(AXProAudioCore* ac)
++{
++    uint32_t frames_generated = ac->msg.write.frame_num;
++    AXProInSample* frame_src = (AXProInSample*) ac->msg.write.frame_src;
++    uint32_t missing_block_frames = ac->lc_missing_block_frames;
++    int16_t* writepos = ac->lc_block_writepos;
++    uint32_t free_blocks = ac->voicebuff_free_blocks;
++
++    do
++    {
++        if(free_blocks)
++        {
++            // split stereo to per channel, we can do this for all stereo frames generated
++            if(frames_generated >= missing_block_frames)
++            {
++                // prepare the full block
++                --free_blocks;
++                #if AXPRO_ACCEPTS_FLOAT_SAMPLES
++                _axpro_split_stereo_float32_naive(writepos, frame_src, ac->streamblock_channel_bytes, missing_block_frames);
++                #else
++                _axpro_split_stereo_int16_naive(writepos, frame_src, ac->streamblock_channel_bytes, missing_block_frames);
++                #endif
++
++                // prepare new block writing
++                frames_generated -= missing_block_frames;
++                int16_t* completed_block_base = ac->lc_block_base;
++                frame_src += (missing_block_frames * AXPRO_CHANNELS);
++                missing_block_frames = ac->streamblock_frames;
++                writepos = _axpro_finish_lc_writeblock_and_start_new(ac);
++                
++                // upload full block and continue...
++                if(frames_generated) _axpro_upload_and_publish_block(ac, completed_block_base);
++                
++                // ...or notify front, then upload the full block and quit
++                else
++                {   AXPro_RunCtlEx(ac->qaudio2main, AXPMCTL_CLREAD_FENCEREACH, free_blocks, OS_MESSAGE_FLAGS_BLOCKING);
++                    _axpro_upload_and_publish_block(ac, completed_block_base);
++                    break;
++                }
++            }
++            else
++            {   // just convert frames and notify front, full block is not ready now
++                missing_block_frames -= frames_generated;
++
++                #if AXPRO_ACCEPTS_FLOAT_SAMPLES
++                _axpro_split_stereo_float32_naive(writepos, frame_src, ac->streamblock_channel_bytes, frames_generated);
++                #else
++                _axpro_split_stereo_int16_naive(writepos, frame_src, ac->streamblock_channel_bytes, frames_generated);
++                #endif
++                writepos += frames_generated;
++                AXPro_RunCtlEx(ac->qaudio2main, AXPMCTL_CLREAD_FENCEREACH, free_blocks, OS_MESSAGE_FLAGS_BLOCKING);
++                break;
++            }
++
++        }
++        else
++        {   if(OSReceiveMessage(&ac->qirq2audio, (OSMessage*)&ac->msg, OS_MESSAGE_FLAGS_BLOCKING))
++            //if(!ac->msg.Call)
++            {   if(ac->msg.ctl.request==AXPMCTL_BLOCK_PLAYED) ++free_blocks;
++                else if(ac->msg.ctl.request==AXPMCTL_QUIT) break;
++            }
++        }
++
++    } while(1);
++
++    // save current state for next write
++    ac->lc_missing_block_frames = missing_block_frames;
++    ac->lc_block_writepos = writepos;
++
++    // drain the interrupt queue and update free blocks
++    while(OSReceiveMessage(&ac->qirq2audio, (OSMessage*)&ac->msg, OS_MESSAGE_FLAGS_NONE))
++        //if(!ac->msg.Call)
++        if(ac->msg.ctl.request == AXPMCTL_BLOCK_PLAYED) ++free_blocks;
++    ac->voicebuff_free_blocks = (uint16_t) free_blocks;
++}
++
+diff --git a/audio/drivers/wiiu_audio2_ext.c b/audio/drivers/wiiu_audio2_ext.c
+new file mode 100644
+index 0000000..f86bd51
+--- /dev/null
++++ b/audio/drivers/wiiu_audio2_ext.c
+@@ -0,0 +1,116 @@
++/*  RetroArch - A frontend for libretro.
++ *  Copyright (C) 2023-2024 - vrda
++ *
++ *  RetroArch is free software: you can redistribute it and/or modify it under the terms
++ *  of the GNU General Public License as published by the Free Software Found-
++ *  ation, either version 3 of the License, or (at your option) any later version.
++ *
++ *  RetroArch is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
++ *  without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
++ *  PURPOSE.  See the GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License along with RetroArch.
++ *  If not, see <http://www.gnu.org/licenses/>.
++ */
++#include "wiiu_audio2.h"
++
++void _axpro_split_stereo_int16_naive(int16_t* dest_left, int16_t* stereo, int32_t channel_byte_offset, uint32_t stereo_frames);
++void _axpro_upload_and_publish_block(AXProAudioCore* ac, int16_t* block_base);
++int16_t* _axpro_finish_lc_writeblock_and_start_new(AXProAudioCore* ac);
++void axpro_pollmode_begin(AXProMainCore* mc);
++void axpro_pollmode_end(AXProMainCore* mc);
++
++
++static uint32_t _axpro_gather_interleaved_stereo(AXProAudioCore* ac, uint32_t frames_generated)
++{
++    // split stereo to per channel, we can do this for all stereo frames generated
++    uint32_t missing_block_frames = ac->lc_missing_block_frames;
++    if(frames_generated >= missing_block_frames)
++    {
++        // convert and publish full block immediately
++        _axpro_split_stereo_int16_naive(ac->lc_block_writepos, ac->lc_base, ac->streamblock_channel_bytes, missing_block_frames); 
++        _axpro_upload_and_publish_block(ac, ac->lc_block_base);
++
++        // adjust bookkeeping and convert any remaining frames
++        frames_generated -= missing_block_frames;
++        int16_t* new_block = _axpro_finish_lc_writeblock_and_start_new(ac);
++        if(frames_generated)
++        {   _axpro_split_stereo_int16_naive(new_block, ac->lc_base + (missing_block_frames * AXPRO_CHANNELS), ac->streamblock_channel_bytes, frames_generated); 
++            new_block += frames_generated;
++            ac->lc_missing_block_frames = ac->streamblock_frames - frames_generated;
++        }
++        else ac->lc_missing_block_frames = ac->streamblock_frames;
++        ac->lc_block_writepos = new_block;
++        return 1;
++    }
++    else
++    {   // just convert frames and adjust bookkeeping, full block still not ready
++        int16_t* writepos = ac->lc_block_writepos;
++        ac->lc_missing_block_frames -= frames_generated;
++        ac->lc_block_writepos = writepos + frames_generated;
++        _axpro_split_stereo_int16_naive(writepos, ac->lc_base, ac->streamblock_channel_bytes, frames_generated); 
++        return 0;
++    }
++}
++
++// special loop for cores allowing to call sample generator from audio core thread
++void axpro_polling_loop(AXProAudioCore* ac, void* gen_samples_ctx, AXPRO_GEN_CALLBACK* GenerateSamples)
++{
++    AXPro_RunCtlEx(&ac->qaudio2irq, AXPMCTL_PING, AXPINGF_SET | AXPIHF_POLLMODE, OS_MESSAGE_FLAGS_BLOCKING);
++    AXPro_Run(ac->qaudio2main, axpro_pollmode_begin);
++    uint32_t stopped_longago = 0;
++    uint32_t free_blocks = ac->streamblocks;
++    uint32_t do_blocking_wait;
++
++    ac->lc_missing_block_frames = ac->streamblock_frames;
++    ac->lc_base_circular = ac->lc_base + (ac->streamblock_frames * AXPRO_CHANNELS);
++    ac->lc_block_writepos = ac->lc_base_circular;
++    ac->lc_block_base = ac->lc_base_circular;
++
++    do
++    {
++        // call the sample generator immediately as long as we have a free block to write to
++        if(free_blocks)
++        {
++            uint32_t frames_generated = GenerateSamples(gen_samples_ctx, ac->lc_base, ac->streamblock_bytes);
++            do_blocking_wait = !frames_generated;
++            
++            if(frames_generated)
++            {   if(_axpro_gather_interleaved_stereo(ac, frames_generated))
++                --free_blocks;
++            }
++
++            // provoke a ping signal when needed so we can safely go to blocking wait
++            else if(!stopped_longago)
++            AXPro_PostCtl(&ac->qaudio2irq, AXPMCTL_PING);
++        }
++        else do_blocking_wait = 2;
++
++        // do a blocking wait for 'block played' signal from interrupt handler - perfectly timed sleep for calling sample generator with full buffer
++        // also, wait on ping signal to avoid busy loop when no data expected
++        if(do_blocking_wait && OSReceiveMessage(&ac->qirq2audio, (OSMessage*)&ac->msg, OS_MESSAGE_FLAGS_BLOCKING))
++            //if(!ac->msg.Call)
++            switch(ac->msg.ctl.request)
++            {   case AXPMCTL_QUIT: goto quit;
++                case AXPMCTL_BLOCK_PLAYED: ++free_blocks; if(do_blocking_wait==2) continue; else break;
++                case AXPMCTL_PING:
++                    if((ac->msg.ctl.pingreqiest & AXPACF_STOPPED_LONGAGO))
++                    {   if(ac->msg.ctl.pingreqiest & AXPINGF_SET) stopped_longago = 1;
++                        else stopped_longago = 0;
++                    }
++                    break;
++            }
++
++        // check our system msgs for control signals
++        if(OSReceiveMessage(&ac->qmain2audio, (OSMessage*)&ac->msg, OS_MESSAGE_FLAGS_NONE))
++        {   if(ac->msg.Call) ac->msg.Call(ac);
++            else break;
++        }
++
++    } while(1);
++
++    quit:
++    ac->lc_base_circular = ac->lc_base;
++    AXPro_RunCtlEx(&ac->qaudio2irq, AXPMCTL_PING, AXPINGF_RESET | AXPIHF_POLLMODE, OS_MESSAGE_FLAGS_NONE);
++    AXPro_Run(ac->qaudio2main, axpro_pollmode_end);
++}
+diff --git a/griffin/griffin.c b/griffin/griffin.c
+index e1bb908..7dbcd45 100644
+--- a/griffin/griffin.c
++++ b/griffin/griffin.c
+@@ -861,6 +861,9 @@
+ #include "../audio/drivers/gx_audio.c"
+ #elif defined(__wiiu__)
+ #include "../audio/drivers/wiiu_audio.c"
++#include "../audio/drivers/wiiu_audio2.c"
++#include "../audio/drivers/wiiu_audio2_core.c"
++#include "../audio/drivers/wiiu_audio2_ext.c"
+ #elif defined(EMSCRIPTEN)
+ #include "../audio/drivers/rwebaudio.c"
+ #elif defined(PSP) || defined(VITA) || defined(ORBIS)
+diff --git a/intl/msg_hash_lbl.h b/intl/msg_hash_lbl.h
+index 2a77316..0592fdd 100644
+--- a/intl/msg_hash_lbl.h
++++ b/intl/msg_hash_lbl.h
+@@ -195,7 +195,7 @@
+    )
+ MSG_HASH(
+    MENU_ENUM_LABEL_AUDIO_DRIVER_WIIU,
+-   "AX"
++   "AX Pro"
+    )
+ #if defined(VITA)
+ MSG_HASH(
+
