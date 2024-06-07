@@ -142,6 +142,7 @@ audio_driver_t *audio_drivers[] = {
 #endif
 #ifdef WIIU
    &audio_ax,
+   &audio_axpro,
 #endif
 #if defined(EMSCRIPTEN) && defined(HAVE_RWEBAUDIO)
    &audio_rwebaudio,
@@ -528,6 +529,12 @@ static void audio_driver_flush(
       audio_st->last_flush_time = flush_time;
    }
 
+#if WIIU_AUDIO_OPTIMIZATION_LEVEL == 1
+   // make sure wiiu axpro audio driver is done with reading float samples
+   void axpro_audio_wait_fence(void* context_audio_data, void* client_buffer); // no-op when not using axpro audio driver
+   axpro_audio_wait_fence(audio_st->context_audio_data, audio_st->output_samples_buf);
+#endif
+
    audio_st->resampler->process(
          audio_st->resampler_data, &src_data);
 
@@ -852,6 +859,16 @@ void audio_driver_sample(int16_t left, int16_t right)
 
 size_t audio_driver_sample_batch(const int16_t *data, size_t frames)
 {
+#if WIIU_AUDIO_OPTIMIZATION_LEVEL >= 2
+   // optimization for avoiding RA resampler and letting audio driver handle core writing
+   // RA options like record, rate control, etc cannot be supported when this is used.
+   audio_driver_state_t* audio_st = &audio_driver_st;
+   if(frames > 1)
+   {  if((audio_st->flags & (AUDIO_FLAG_SUSPENDED|AUDIO_FLAG_ACTIVE)) == AUDIO_FLAG_ACTIVE)
+      return audio_st->current_audio->write(audio_st->context_audio_data, data, frames * 4);
+   }
+   return frames;
+#else
    uint32_t runloop_flags;
    size_t frames_remaining        = frames;
    recording_state_t *record_st   = recording_state_get_ptr();
@@ -901,6 +918,7 @@ size_t audio_driver_sample_batch(const int16_t *data, size_t frames)
       data             += frames_to_write << 1;
    }
    while (frames_remaining > 0);
+#endif // WIIU_AUDIO_OPTIMIZATION_LEVEL < 2
 
    return frames;
 }

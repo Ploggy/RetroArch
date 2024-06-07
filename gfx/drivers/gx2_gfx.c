@@ -896,6 +896,13 @@ static void gx2_set_tex_coords(frame_vertex_t *v,
    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_ATTRIBUTE_BUFFER, v, 4 * sizeof(*v));
 }
 
+unsigned short *pcsx_rearmed_vram __attribute__((weak));
+unsigned int pcsx_stride __attribute__((weak));
+unsigned int pcsx_x __attribute__((weak));
+unsigned int pcsx_y __attribute__((weak));
+unsigned int pcsx_w __attribute__((weak));
+unsigned int pcsx_h __attribute__((weak));
+
 static void gx2_set_projection(wiiu_video_t *wiiu)
 {
    static math_matrix_4x4 rot     = {
@@ -1529,7 +1536,8 @@ static void gx2_free(void *data)
 
    MEM2_free(wiiu->ctx_state);
    MEM2_free(wiiu->cmd_buffer);
-   MEM2_free(wiiu->texture.surface.image);
+   if (wiiu->texture_data)
+       MEM2_free(wiiu->texture_data);
    MEM2_free(wiiu->menu.texture.surface.image);
    MEM2_free(wiiu->v);
    MEM2_free(wiiu->menu.v);
@@ -1553,9 +1561,14 @@ static void gx2_free(void *data)
 
 static bool wiiu_init_frame_textures(wiiu_video_t *wiiu, unsigned width, unsigned height)
 {
+   video_driver_state_t *state = video_state_get_ptr();
+   bool bgr555;
    unsigned i;
 
-   MEM2_free(wiiu->texture.surface.image);
+   if (wiiu->texture_data) {
+       MEM2_free(wiiu->texture_data);
+       wiiu->texture_data = NULL;
+   }
 
    if (wiiu->shader_preset)
    {
@@ -1570,10 +1583,13 @@ static bool wiiu_init_frame_textures(wiiu_video_t *wiiu, unsigned width, unsigne
       }
    }
 
+   bgr555 = state->pix_fmt == RETRO_PIXEL_FORMAT_0BGR1555;
+
    /* Initialize frame texture */
    memset(&wiiu->texture, 0, sizeof(GX2Texture));
    wiiu->texture.surface.width       = width;
    wiiu->texture.surface.height      = height;
+   //wiiu->texture.surface.pitch       = pcsx_stride;
    wiiu->texture.surface.depth       = 1;
    wiiu->texture.surface.dim         = GX2_SURFACE_DIM_TEXTURE_2D;
    wiiu->texture.surface.tileMode    = GX2_TILE_MODE_LINEAR_ALIGNED;
@@ -1584,6 +1600,11 @@ static bool wiiu_init_frame_textures(wiiu_video_t *wiiu, unsigned width, unsigne
       wiiu->texture.surface.format   = GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8;
       wiiu->texture.compMap          = GX2_COMP_SEL(_G, _B, _A, _1);
    }
+   else if (bgr555)
+   {
+      wiiu->texture.surface.format   = GX2_SURFACE_FORMAT_UNORM_R5_G5_B5_A1;
+      wiiu->texture.compMap          = GX2_COMP_SEL(_R, _G, _B, _1);
+   }
    else
    {
       wiiu->texture.surface.format   = GX2_SURFACE_FORMAT_UNORM_R5_G6_B5;
@@ -1593,9 +1614,17 @@ static bool wiiu_init_frame_textures(wiiu_video_t *wiiu, unsigned width, unsigne
    GX2CalcSurfaceSizeAndAlignment(&wiiu->texture.surface);
    GX2InitTextureRegs(&wiiu->texture);
 
-   wiiu->texture.surface.image = MEM2_alloc(wiiu->texture.surface.imageSize,
-                                 wiiu->texture.surface.alignment);
-   memset(wiiu->texture.surface.image, 0x0, wiiu->texture.surface.imageSize);
+   if (pcsx_stride && bgr555) {
+       wiiu->texture.surface.image =
+	       (unsigned short *)((uintptr_t)pcsx_rearmed_vram
+				  & ~(wiiu->texture.surface.alignment - 1));
+   } else {
+       wiiu->texture_data = MEM2_alloc(wiiu->texture.surface.imageSize,
+                                       wiiu->texture.surface.alignment);
+       memset(wiiu->texture_data, 0x0, wiiu->texture.surface.imageSize);
+       wiiu->texture.surface.image = wiiu->texture_data;
+   }
+
    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, wiiu->texture.surface.image,
                  wiiu->texture.surface.imageSize);
 
@@ -1888,6 +1917,10 @@ static bool gx2_frame(void *data, const void *frame,
    struct font_params *osd_params = (struct font_params*)
       &video_info->osd_stat_params;
    bool statistics_show           = video_info->statistics_show;
+   video_driver_state_t *state;
+   unsigned int img_width, img_height;
+   float u0, v0, u1, v1;
+   bool bgr555;
 
    if (wiiu->vsync)
    {
@@ -1921,14 +1954,22 @@ static bool gx2_frame(void *data, const void *frame,
 
    if (frame)
    {
-      if (    (width  != wiiu->texture.surface.width)
-           || (height != wiiu->texture.surface.height))
-         wiiu_init_frame_textures(wiiu, width, height);
+      state = video_state_get_ptr();
+      bgr555 = state->pix_fmt == RETRO_PIXEL_FORMAT_0BGR1555;
+      img_width = bgr555 ? 1024 : width;
+      img_height = bgr555 ? 1024 : height;
+
+      if (    (img_width  != wiiu->texture.surface.width)
+           || (img_height != wiiu->texture.surface.height))
+         wiiu_init_frame_textures(wiiu, img_width, img_height);
 
       wiiu->width  = width;
       wiiu->height = height;
 
-      if (wiiu->rgb32)
+      if (pcsx_stride && bgr555) {
+	      /* Nothing to do */
+      }
+      else if (wiiu->rgb32)
       {
          const uint32_t *src = frame;
          uint32_t       *dst = (uint32_t *)wiiu->texture.surface.image;
@@ -1961,10 +2002,28 @@ static bool gx2_frame(void *data, const void *frame,
          }
       }
 
-      GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, wiiu->texture.surface.image,
-                    wiiu->texture.surface.imageSize);
+      if (pcsx_stride && bgr555) {
+	      u0 = ((uintptr_t)pcsx_rearmed_vram
+		    & (wiiu->texture.surface.alignment - 1)) / 2 + pcsx_x;
+	      v0 = pcsx_y;
+	      u1 = pcsx_w + u0;
+	      v1 = pcsx_h + v0;
 
-      gx2_set_tex_coords(wiiu->v, &wiiu->texture, 0, 0, width, height, wiiu->rotation);
+	      /* Only invalidate what we will display */
+	      GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE,
+			    pcsx_rearmed_vram + pcsx_stride * pcsx_y + pcsx_x,
+			    pcsx_stride * pcsx_h * sizeof(uint16_t));
+      } else {
+	      u0 = 0;
+	      v0 = 0;
+	      u1 = width;
+	      v1 = height;
+
+	      GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, wiiu->texture.surface.image,
+			    wiiu->texture.surface.imageSize);
+      }
+
+      gx2_set_tex_coords(wiiu->v, &wiiu->texture, u0, v0, u1, v1, wiiu->rotation);
    }
 
    GX2SetShaderMode(GX2_SHADER_MODE_UNIFORM_BLOCK);

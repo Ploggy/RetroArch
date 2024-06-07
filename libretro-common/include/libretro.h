@@ -5611,6 +5611,8 @@ enum retro_pixel_format
     */
    RETRO_PIXEL_FORMAT_RGB565   = 2,
 
+   RETRO_PIXEL_FORMAT_0BGR1555 = 3,
+
    /** Defined to ensure that <tt>sizeof(retro_pixel_format) == sizeof(int)</tt>. Do not use. */
    RETRO_PIXEL_FORMAT_UNKNOWN  = INT_MAX
 };

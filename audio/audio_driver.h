@@ -428,6 +428,7 @@ extern audio_driver_t audio_xenon360;
 extern audio_driver_t audio_ps3;
 extern audio_driver_t audio_gx;
 extern audio_driver_t audio_ax;
+extern audio_driver_t audio_axpro;
 extern audio_driver_t audio_psp;
 extern audio_driver_t audio_ps2;
 extern audio_driver_t audio_ctr_csnd;

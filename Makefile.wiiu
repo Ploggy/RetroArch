@@ -189,6 +189,10 @@ ifneq ($(PC_DEVELOPMENT_TCP_PORT),)
    DEFINES += -DPC_DEVELOPMENT_TCP_PORT=$(PC_DEVELOPMENT_TCP_PORT)
 endif
 
+ifneq ($(WIIU_AUDIO_OPTIMIZATION_LEVEL),)
+   DEFINES += -DWIIU_AUDIO_OPTIMIZATION_LEVEL=$(WIIU_AUDIO_OPTIMIZATION_LEVEL)
+endif
+
 INCDIRS += -I.
 INCDIRS += -Ilibretro-common/include
 INCDIRS += -Iwiiu
@@ -212,7 +216,7 @@ ASFLAGS := $(CFLAGS) -mregnames
 # Linking/library flags
 
 LIBDIRS := -L.
-LDFLAGS := $(CFLAGS)
+LDFLAGS := $(CFLAGS) -T$(DEVKITPRO)/wums/share/libmappedmemory.ld
 
 ifeq ($(WHOLE_ARCHIVE_LINK), 1)
    WHOLE_START := -Wl,--whole-archive
@@ -264,13 +268,14 @@ NM      := $(PREFIX)nm
 LD      := $(CXX)
 
 WUT_ROOT ?= $(DEVKITPRO)/wut
+WUMS_ROOT ?= $(DEVKITPRO)/wums
 
 RPXSPECS := -specs=$(WUT_ROOT)/share/wut.specs
 RPLSPECS := -specs=$(WUT_ROOT)/share/wut.specs -specs=$(WUT_ROOT)/share/rpl.specs
 
-INCDIRS += -I$(WUT_ROOT)/include
-LIBDIRS += -L$(WUT_ROOT)/lib
-LIBS += -lwut
+INCDIRS += -I$(WUT_ROOT)/include -I$(WUMS_ROOT)/include
+LIBDIRS += -L$(WUT_ROOT)/lib -L$(WUMS_ROOT)/lib
+LIBS += -lwut -lmappedmemory
 
 #-----------------------------
 # Targets and build rules

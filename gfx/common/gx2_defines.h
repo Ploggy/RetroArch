@@ -87,6 +87,7 @@ typedef struct
    void *output_ring_buffer;
    uint32_t input_ring_buffer_size;
    uint32_t output_ring_buffer_size;
+   void *texture_data;
 
    int width;
    int height;

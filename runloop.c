@@ -2040,7 +2040,9 @@ bool runloop_environment_cb(unsigned cmd, void *data)
             case RETRO_PIXEL_FORMAT_0RGB1555:
                RARCH_LOG("[Environ]: SET_PIXEL_FORMAT: 0RGB1555.\n");
                break;
-
+            case RETRO_PIXEL_FORMAT_0BGR1555:
+               RARCH_LOG("[Environ]: SET_PIXEL_FORMAT: 0BGR1555.\n");
+               break;
             case RETRO_PIXEL_FORMAT_RGB565:
                RARCH_LOG("[Environ]: SET_PIXEL_FORMAT: RGB565.\n");
                break;
