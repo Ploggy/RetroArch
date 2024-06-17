@@ -25,9 +25,8 @@
 // build system specifics
 //--------------------------------------
 
-// fcon:change this to real wut build define or just completely remove the Tiramisu RA includes below
-#define WUT_BUILD (!defined(HAVE_IOSUHAX))
-#if WUT_BUILD
+#if (!defined(HAVE_IOSUHAX))
+// "wut" build (Newer devkitPPC r45)
 #include <coreinit/thread.h>
 #include <coreinit/messagequeue.h>
 #include <coreinit/time.h>
@@ -41,7 +40,7 @@
 #define AXPro_MemFree(Ptr)              MEMFreeToDefaultHeap(Ptr)
 
 #else
-// build without WUT (current RetroArch build is using devkitPPC r29)
+// build without WUT (RetroArch build was using devkitPPC r29)
 #include <wiiu/os/thread.h>
 #include <wiiu/os/systeminfo.h>
 #include <wiiu/os/messagequeue.h>
@@ -59,7 +58,7 @@ AXFrameCallback AXRegisterFrameCallback(AXFrameCallback callback);
 #endif // non WUT build
 
 
-// common (wut also) missing definitions  // fcon:aroma - check where should this go
+// common (wut also) missing definitions  // TODO:aroma - check where should this go
 extern uint32_t LCEnableDMA();
 //extern void LCDisableDMA();
 extern void* LCAlloc(uint32_t bytes);
@@ -73,7 +72,9 @@ extern void LCStoreDMABlocks(void* destMem, const void* srcLC, uint32_t cache_li
 
 // compile time configuration
 //--------------------------------------
-#define AXPRO_CORE_AUDIO                0   // coreid we will use for audio processing  (1 is by default the "main" core, 0 and 2 are available)
+#define AXPRO_THREAD_CORE               OS_THREAD_ATTRIB_AFFINITY_CPU2 // 1 is main core, 0 and 2 are available for us
+#define AXPRO_THREAD_STACKSIZE          32768
+#define AXPRO_THREAD_PRIORITY           15  // 0=highest, 16=default, 31=lowest
 
 #define AXPRO_CACHELINE_SIZE            32  // these are pretty much set in stone
 #define AXPRO_CACHEFETCH_SIZE           64
@@ -126,11 +127,11 @@ extern void LCStoreDMABlocks(void* destMem, const void* srcLC, uint32_t cache_li
 #endif
 
 #if WIIU_AUDIO_OPTIMIZATION_LEVEL == 0      // default - full RA options supported, no changes needed in RA or core code
-#define AXPRO_ACCEPTS_FLOAT_SAMPLES     1   // take the float conversion off the main thread 
+#define AXPRO_ACCEPTS_FLOAT_SAMPLES     1   // take the float conversion off the main thread
 #define AXPRO_IMPLICIT_NONBLOCK_OPTIM   0   // wait in write until we read all the client data
 
 #elif WIIU_AUDIO_OPTIMIZATION_LEVEL == 1    // lite optimization - full RA options supported, lite changes needed in RA code
-#define AXPRO_ACCEPTS_FLOAT_SAMPLES     1   // take the float conversion off the main thread 
+#define AXPRO_ACCEPTS_FLOAT_SAMPLES     1   // take the float conversion off the main thread
 #define AXPRO_IMPLICIT_NONBLOCK_OPTIM   1   // RA will call axpro_audio_wait_fence before writing into memory passed to previous write call
 
 #elif WIIU_AUDIO_OPTIMIZATION_LEVEL == 2    // fast direct int16 - no RA options like FF, record, rate control, etc. Changes RA to avoid parts of audio pipeline
@@ -169,7 +170,7 @@ extern void LCStoreDMABlocks(void* destMem, const void* srcLC, uint32_t cache_li
 
 #define AXPro_Run(Queue, Call)                      \
 {   AXPRO_ALIGNED_DECLARE_CLINE1(OSMessage msg);    \
-    msg.message = (void*) (Call);                   \
+    msg.message = (void*) ((uintptr_t) (Call));     \
     AXPro_RunMsg(Queue, msg);                       \
 }
 
@@ -250,7 +251,7 @@ typedef struct AXProMsgCtlPart
     uint8_t             _res1b[3];
     union {
     AXProSampleGenData  setgen;
-    uint32_t            pingreqiest;        // AXPIHF_...
+    uint32_t            pingrequest;        // AXPIHF_...
     uint32_t            ctlgeneral[2];
     };
 } AXProMsgCtlPart;
@@ -306,7 +307,7 @@ typedef struct AXProFrameCallbackData
     uint32_t                    prepared_streamblocks;
 
     uint16_t                    stopped_state_duration;
-    
+
     uint16_t                    rate_idx_set;
     uint16_t                    rate_change_timeout;
     uint16_t                    _resw1;
