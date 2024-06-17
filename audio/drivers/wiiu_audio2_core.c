@@ -20,6 +20,8 @@ typedef struct GlobalDataAudioCore
 {   AXProAudioCore*         ac;
     uint32_t                unusedu[7];
 //---
+    uint8_t                 thread_stack[AXPRO_THREAD_STACKSIZE];
+    OSThread                thread_handle;
 
 } GlobalDataAudioCore; AXPRO_ALIGNED_DECLARE_CLINE2(GlobalDataAudioCore ga);
 
@@ -42,7 +44,7 @@ static inline void _axpro_begin_playing(AXProFrameCallbackData* idat)
 {   //print_irq("bufferred %d blocks, starting play\n", idat->prepared_streamblocks);
     idat->prev_loopcount = AXGetVoiceLoopCount(idat->voice_l);
     _axpro_continue_playing(idat);
-    // fcon: what about fade in ?
+    // TODO: what about fade in ?
 }
 
 
@@ -117,8 +119,8 @@ void axpro_audioframe_callback()
                 break;
 
             case AXPMCTL_PING:
-                if(msg.ctl.pingreqiest & AXPINGF_SET) idat->flags |= (msg.ctl.pingreqiest & ~AXPINGF_SET);
-                else if(msg.ctl.pingreqiest & AXPINGF_RESET) idat->flags &= ~(msg.ctl.pingreqiest & ~AXPINGF_RESET);
+                if(msg.ctl.pingrequest & AXPINGF_SET) idat->flags |= (msg.ctl.pingrequest & ~AXPINGF_SET);
+                else if(msg.ctl.pingrequest & AXPINGF_RESET) idat->flags &= ~(msg.ctl.pingrequest & ~AXPINGF_RESET);
                 AXPro_PostCtl(&_ac->qirq2audio, AXPMCTL_PING);
                 break;
         }
@@ -148,7 +150,7 @@ void axpro_audioframe_callback()
             if(prepared_streamblocks >= AXPRO_MINBLOCKS_FOR_PLAY)
             {
                 idat->state = AXPACS_PLAYING;
-                if(idat->stopped_state_duration) 
+                if(idat->stopped_state_duration)
                 {   idat->stopped_state_duration = 0;
                     AXPro_RunCtlEx(&_ac->qirq2audio, AXPMCTL_PING, AXPINGF_RESET | AXPACF_STOPPED_LONGAGO, OS_MESSAGE_FLAGS_NONE);
                 }
@@ -264,7 +266,7 @@ void axpro_audioframe_callback()
         break;
     };
 
-    // fcon:update mixer for fades to work
+    // TODO:update mixer for fades to work
 }
 
 
@@ -296,8 +298,8 @@ int axpro_core_main(int args, OSMessageQueue* q2main)
 
     ac->qaudio2main = q2main;
     OSInitMessageQueue(&ac->qmain2audio, ac->msgstore_main2audio, AXPRO_MAX_MSGS_MAIN2AUDIO);
-    AXProMsgAudio2Main ready_msg; ready_msg.Call = axpro_thread_ready; 
-    ready_msg.ready.ac = ac; ready_msg.ready.q2audio = &ac->qmain2audio; ready_msg.ready.q2irq = &ac->qmain2irq; 
+    AXProMsgAudio2Main ready_msg; ready_msg.Call = axpro_thread_ready;
+    ready_msg.ready.ac = ac; ready_msg.ready.q2audio = &ac->qmain2audio; ready_msg.ready.q2irq = &ac->qmain2irq;
     AXPro_RunMsg(q2main, ready_msg);
 
     // init main core --> interrupt handler <---> audio core message queues
@@ -312,12 +314,12 @@ int axpro_core_main(int args, OSMessageQueue* q2main)
         {   checkctl:
             if(ac->msg.ctl.request==AXPMCTL_QUIT) break;
             else if(ac->msg.ctl.request==AXPMCTL_CHANGE_SAMPLEGEN)
-            {   if(ac->msg.ctl.setgen.GenerateSamples) 
+            {   if(ac->msg.ctl.setgen.GenerateSamples)
                 {   axpro_polling_loop(ac, ac->msg.ctl.setgen.samplegen_ctx, ac->msg.ctl.setgen.GenerateSamples);
                     goto checkctl;
                 }
             }
-            
+
             // respond to main core with fresh free blocks when pinging us
             else if(ac->msg.ctl.request==AXPMCTL_PING)
             {
@@ -342,6 +344,21 @@ int axpro_core_main(int args, OSMessageQueue* q2main)
     return 0;
 }
 
+int axpro_run_core(OSMessageQueue* qaudio2main)
+{
+    if(OSCreateThread(&ga.thread_handle,
+        (OSThreadEntryPointFn) axpro_core_main,
+        0, (char*) qaudio2main,
+        ga.thread_stack + AXPRO_THREAD_STACKSIZE, AXPRO_THREAD_STACKSIZE,
+        AXPRO_THREAD_PRIORITY, AXPRO_THREAD_CORE | OS_THREAD_ATTRIB_DETACHED
+    ))
+    {   OSResumeThread(&ga.thread_handle);
+        // we're running this from main core, thread handle is not needed in cache
+        DCFlushRange(&ga.thread_handle, sizeof(ga.thread_handle));
+        return 0;
+    }
+    else return 1;
+}
 
 
 // sound rendering into circular buffers
@@ -376,7 +393,7 @@ void _axpro_upload_and_publish_block(AXProAudioCore* ac, int16_t* block_base)
     // this is a blocking call, we can immediately publish block ready
     LCStoreDMABlocks(ac->voicebuff_writeblock, block_base, AXPRO_CLINES4FRAMES(ac->streamblock_frames));
     AXPro_RunCtl(&ac->qaudio2irq, AXPMCTL_BLOCK_READY);
-    
+
     if(ac->voicebuff_writeblock < ac->voicebuff_last_block)
     ac->voicebuff_writeblock = (int16_t*) ((uint8_t*)ac->voicebuff_writeblock + ac->streamblock_bytes);
     else ac->voicebuff_writeblock = ac->voicebuff;
@@ -436,10 +453,10 @@ void _axpro_write(AXProAudioCore* ac)
                 frame_src += (missing_block_frames * AXPRO_CHANNELS);
                 missing_block_frames = ac->streamblock_frames;
                 writepos = _axpro_finish_lc_writeblock_and_start_new(ac);
-                
+
                 // upload full block and continue...
                 if(frames_generated) _axpro_upload_and_publish_block(ac, completed_block_base);
-                
+
                 // ...or notify front, then upload the full block and quit
                 else
                 {   AXPro_RunCtlEx(ac->qaudio2main, AXPMCTL_CLREAD_FENCEREACH, free_blocks, OS_MESSAGE_FLAGS_BLOCKING);
