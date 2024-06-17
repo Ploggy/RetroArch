@@ -28,14 +28,14 @@ static uint32_t _axpro_gather_interleaved_stereo(AXProAudioCore* ac, uint32_t fr
     if(frames_generated >= missing_block_frames)
     {
         // convert and publish full block immediately
-        _axpro_split_stereo_int16_naive(ac->lc_block_writepos, ac->lc_base, ac->streamblock_channel_bytes, missing_block_frames);
+        _axpro_split_stereo_int16_naive(ac->lc_block_writepos, ac->lc_base, ac->streamblock_channel_bytes, missing_block_frames); 
         _axpro_upload_and_publish_block(ac, ac->lc_block_base);
 
         // adjust bookkeeping and convert any remaining frames
         frames_generated -= missing_block_frames;
         int16_t* new_block = _axpro_finish_lc_writeblock_and_start_new(ac);
         if(frames_generated)
-        {   _axpro_split_stereo_int16_naive(new_block, ac->lc_base + (missing_block_frames * AXPRO_CHANNELS), ac->streamblock_channel_bytes, frames_generated);
+        {   _axpro_split_stereo_int16_naive(new_block, ac->lc_base + (missing_block_frames * AXPRO_CHANNELS), ac->streamblock_channel_bytes, frames_generated); 
             new_block += frames_generated;
             ac->lc_missing_block_frames = ac->streamblock_frames - frames_generated;
         }
@@ -48,7 +48,7 @@ static uint32_t _axpro_gather_interleaved_stereo(AXProAudioCore* ac, uint32_t fr
         int16_t* writepos = ac->lc_block_writepos;
         ac->lc_missing_block_frames -= frames_generated;
         ac->lc_block_writepos = writepos + frames_generated;
-        _axpro_split_stereo_int16_naive(writepos, ac->lc_base, ac->streamblock_channel_bytes, frames_generated);
+        _axpro_split_stereo_int16_naive(writepos, ac->lc_base, ac->streamblock_channel_bytes, frames_generated); 
         return 0;
     }
 }
@@ -74,7 +74,7 @@ void axpro_polling_loop(AXProAudioCore* ac, void* gen_samples_ctx, AXPRO_GEN_CAL
         {
             uint32_t frames_generated = GenerateSamples(gen_samples_ctx, ac->lc_base, ac->streamblock_bytes);
             do_blocking_wait = !frames_generated;
-
+            
             if(frames_generated)
             {   if(_axpro_gather_interleaved_stereo(ac, frames_generated))
                 --free_blocks;
@@ -94,8 +94,8 @@ void axpro_polling_loop(AXProAudioCore* ac, void* gen_samples_ctx, AXPRO_GEN_CAL
             {   case AXPMCTL_QUIT: goto quit;
                 case AXPMCTL_BLOCK_PLAYED: ++free_blocks; if(do_blocking_wait==2) continue; else break;
                 case AXPMCTL_PING:
-                    if((ac->msg.ctl.pingrequest & AXPACF_STOPPED_LONGAGO))
-                    {   if(ac->msg.ctl.pingrequest & AXPINGF_SET) stopped_longago = 1;
+                    if((ac->msg.ctl.pingreqiest & AXPACF_STOPPED_LONGAGO))
+                    {   if(ac->msg.ctl.pingreqiest & AXPINGF_SET) stopped_longago = 1;
                         else stopped_longago = 0;
                     }
                     break;
