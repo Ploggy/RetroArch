@@ -13,6 +13,7 @@
  *  If not, see <http://www.gnu.org/licenses/>.
  */
 #include "wiiu_audio2.h"
+#include <proc_ui/procui.h>
 
 
 // just couldn't resist using global data, at least separate the cache lines
@@ -34,12 +35,12 @@ typedef struct GlobalDataMainCore
 static void _axpro_init_streaming(AXProAudioCore* ac, uint32_t streamblocks, uint32_t streamblock_bytes, uint32_t frames_per_interrupt, float req_rate)
 {
     uint32_t streamblock_frames = streamblock_bytes / (AXPRO_CHANNELS * AXPRO_SAMPLE_BYTES);
-    
+
     ac->streamblocks = (uint16_t) streamblocks;
     ac->streamblock_frames = (uint16_t) streamblock_frames;
     ac->streamblock_bytes = streamblock_bytes;
     ac->streamblock_channel_bytes = streamblock_bytes / AXPRO_CHANNELS;
-    
+
     ac->interrupt_data.streamblock_frames = (uint16_t) streamblock_frames;
     ac->interrupt_data.streamblock_samples = (uint16_t) streamblock_frames * AXPRO_CHANNELS;
     ac->interrupt_data.streamblocks = streamblocks;
@@ -63,11 +64,11 @@ static void _axpro_init_streaming(AXProAudioCore* ac, uint32_t streamblocks, uin
     //print_ac("axpro blocks=%d, block_bytes=%d, block_samples=%d\n", streamblocks, streamblock_bytes, streamblock_bytes / (AXPRO_CHANNELS * AXPRO_SAMPLE_BYTES));
 }
 
-int axpro_core_main(int args, OSMessageQueue* q2main);
+int axpro_run_core(OSMessageQueue* qaudio2main);
 void axpro_audioframe_callback();
 void _axpro_write(AXProAudioCore* ac);
 
-static void axpro_hw_ready(AXProMainCore* mc) 
+static void axpro_hw_ready(AXProMainCore* mc)
 {   mc->flags |= AXPMCF_HW_READY;
     mc->total_streamblocks = mc->msg.hwready.streamblocks;
 }
@@ -101,7 +102,7 @@ static void _axpro_init_timing(AXProAudioCore* ac, float req_latency_ms, float r
 
 static void _axpro_assign_voices_to_devices(AXProAudioCore* ac)
 {
-    // fcon: what about wii set to surround mode ?
+    // TODO: what about wii set to surround mode ?
     AXVoiceDeviceMixData channel_mix[6];
     memset(channel_mix, 0, sizeof(channel_mix));
     channel_mix[0].bus[0].volume = 0x8000; // 1.0 in 1:15 fixed point
@@ -159,7 +160,7 @@ static void _axpro_init_hw(AXProAudioCore* ac)
     {   uint32_t lc_size = ac->streamblock_bytes * AXPRO_STREAMBLOCKS_LC;
         AXPRO_ALIGN_SIZE(lc_size, AXPRO_LCACHE_ALIGNMENT);
         int16_t* lc_base = (int16_t*) LCAlloc(lc_size);
-        if(lc_base) 
+        if(lc_base)
         {   ac->lc_base = lc_base;
             ac->lc_base_circular = lc_base;
             ac->lc_block_writepos = lc_base;
@@ -202,7 +203,7 @@ void axpro_close_hw(AXProAudioCore* ac)
     AXRegisterFrameCallback(ac->interrupt_data.prev_ax_framecallback);
     if(ac->lc_base)
     {   LCDealloc(ac->lc_base);
-        //LCDisableDMA(); // fcon:aroma - check how is this handled system wide, not handling bg switch at the moment and we're defaulting on core 0
+        //LCDisableDMA(); // TODO:aroma - check how is this handled system wide, not handling bg switch at the moment and we're defaulting on core 0
     }
     if(ac->interrupt_data.voice_r) AXFreeVoice(ac->interrupt_data.voice_r);
     if(ac->interrupt_data.voice_l) AXFreeVoice(ac->interrupt_data.voice_l);
@@ -225,12 +226,16 @@ static void axpro_audio_free(AXProMainCore* mc)
             while(OSReceiveMessage(&mc->qaudio2main, (OSMessage*) &mc->msg, OS_MESSAGE_FLAGS_NONE)) if(mc->msg.Call) mc->msg.Call(mc);
             AXPro_RunCtl(mc->qmain2irq, AXPMCTL_QUIT);
             AXPro_RunCtl(mc->qmain2audio, AXPMCTL_QUIT);
+            if(!ProcUIInShutdown()) // no point blocking here when audio thread is suspended during shutdown
             AXPro_Wait(mc, mc->flags & AXPMCF_HW_CLOSED, break, break);
         }
         AXPro_MemFree(mc);
         gm.mc = NULL;
     }
 }
+
+static ssize_t axpro_audio_write(AXProMainCore* mc, AXProInSample* samples, size_t size_bytes);
+static inline void axpro_audio_set_writer(ssize_t (*new_writer)(AXProMainCore*, AXProInSample*, size_t));
 
 static void* axpro_audio_init(const char* device, unsigned rate, unsigned latency, unsigned block_frames, unsigned* new_rate)
 {
@@ -239,14 +244,12 @@ static void* axpro_audio_init(const char* device, unsigned rate, unsigned latenc
         mc = (AXProMainCore*) AXPro_MemAlloc(main_core_data_sizeof, AXPRO_CACHEFETCH_SIZE);
     }
     if(mc)
-    {   // init model and queue
+    {   // init model and queue and run the audio core thread
         DCZeroRange(mc, sizeof(AXProMainCore));
         memset(mc, 0, sizeof(AXProMainCore));
+        axpro_audio_set_writer(axpro_audio_write);
         OSInitMessageQueue(&mc->qaudio2main, mc->msgstore_audio2main, AXPRO_MAX_MSGS_AUDIO2MAIN);
-
-        // fcon: normal core-tied thread can just be created here if default core thread will be used in the future by RetroArch
-        OSThread* audio_thread = OSGetDefaultThread(AXPRO_CORE_AUDIO);
-        OSRunThread(audio_thread, (OSThreadEntryPointFn) axpro_core_main, 1, (const char**)&mc->qaudio2main);
+        if(axpro_run_core(&mc->qaudio2main)!=0) goto error_init;
 
         // wait for audio thread ready then init driver with prepared msg
         AXProMsgMain2Audio init_msg;
@@ -281,7 +284,7 @@ static void* axpro_audio_init(const char* device, unsigned rate, unsigned latenc
 
 static bool axpro_audio_alive(AXProMainCore* mc) { return (mc->flags & (AXPMCF_HW_READY | AXPMCF_HW_CLOSED)) == AXPMCF_HW_READY; }
 static bool axpro_audio_use_float(AXProMainCore* mc) { return (bool) (AXPRO_ACCEPTS_FLOAT_SAMPLES); }
-static void axpro_audio_set_nonblock_state(AXProMainCore* mc, bool toggle) 
+static void axpro_audio_set_nonblock_state(AXProMainCore* mc, bool toggle)
 {   if(toggle) mc->flags |= AXPMCF_NONBLOCK;
     else mc->flags &= ~AXPMCF_NONBLOCK;
 }
@@ -310,7 +313,7 @@ static ssize_t axpro_audio_write(AXProMainCore* mc, AXProInSample* samples, size
             return 0;
         }
     }
-    
+
     if(size_bytes)
     {   uint32_t frames = (uint32_t) (size_bytes / (AXPRO_CHANNELS * sizeof(AXProInSample)));
         if(frames)
@@ -357,37 +360,43 @@ audio_driver_t audio_axpro =
 // when using polling mode, direct write must be disabled without slowing it down otherwise
 //----------------------------------------------------------------------------------------------------
 
-static void _axpro_write_empty(AXProAudioCore* ac)  { };
+static void _axpro_write_empty(AXProAudioCore* ac)  { }
 static ssize_t axpro_audio_write_empty(AXProMainCore* mc, AXProInSample* samples, size_t size_bytes)
 {   // drain the queue so ending poll mode and fence msgs can get through
-    while(OSReceiveMessage(&mc->qaudio2main, (OSMessage*) &mc->msg, OS_MESSAGE_FLAGS_NONE)) 
+    while(OSReceiveMessage(&mc->qaudio2main, (OSMessage*) &mc->msg, OS_MESSAGE_FLAGS_NONE))
         if(mc->msg.Call) mc->msg.Call(mc);
         else if(mc->msg.ctl.request == AXPMCTL_CLREAD_FENCEREACH)
         {   mc->free_streamblocks = (uint16_t) mc->msg.ctl.ctlgeneral[0];
             mc->reading_client_buffer = NULL;
         }
-        else if(mc->msg.ctl.request == AXPMCTL_PING) 
+        else if(mc->msg.ctl.request == AXPMCTL_PING)
             mc->free_streamblocks = (uint16_t) mc->msg.ctl.ctlgeneral[0];
     return 0;
 }
 
-void axpro_pollmode_begin(AXProMainCore* mc) 
-{   mc->flags |= AXPMCF_POLLMODE; 
+
+static inline void axpro_audio_set_writer(ssize_t (*new_writer)(AXProMainCore*, AXProInSample*, size_t))
+{
+    audio_axpro.write = (ssize_t (*) (void*, const void*, size_t)) new_writer;
+}
+
+void axpro_pollmode_begin(AXProMainCore* mc)
+{   mc->flags |= AXPMCF_POLLMODE;
     mc->writemsg.Call = _axpro_write_empty;
-    audio_axpro.write = (ssize_t (*) (void*, const void*, size_t)) axpro_audio_write_empty;
+    axpro_audio_set_writer(axpro_audio_write_empty);
     mc->reading_client_buffer = NULL;
 }
 
-void axpro_pollmode_end(AXProMainCore* mc) 
-{   mc->flags &= ~AXPMCF_POLLMODE; 
+void axpro_pollmode_end(AXProMainCore* mc)
+{   mc->flags &= ~AXPMCF_POLLMODE;
     mc->writemsg.Call = _axpro_write;
-    audio_axpro.write = (ssize_t (*) (void*, const void*, size_t)) axpro_audio_write;
+    axpro_audio_set_writer(axpro_audio_write);
 }
 
-static bool axpro_audio_stop(AXProMainCore* mc) 
+static bool axpro_audio_stop(AXProMainCore* mc)
 {   if(!(mc->flags & (AXPMCF_POLLMODE | AXPMCF_STOPPED)))
     {   mc->flags |= AXPMCF_STOPPED;
-        audio_axpro.write = (ssize_t (*) (void*, const void*, size_t)) axpro_audio_write_empty;
+        axpro_audio_set_writer(axpro_audio_write_empty);
     }
     return true;
 }
@@ -395,7 +404,7 @@ static bool axpro_audio_stop(AXProMainCore* mc)
 static bool axpro_audio_start(AXProMainCore* mc, bool is_shutdown)
 {   if((mc->flags & AXPMCF_STOPPED) && !(mc->flags & AXPMCF_POLLMODE))
     {   mc->flags &= ~AXPMCF_STOPPED;
-        audio_axpro.write = (ssize_t (*) (void*, const void*, size_t)) axpro_audio_write;
+        axpro_audio_set_writer(axpro_audio_write);
     }
     return true;
 }
@@ -416,12 +425,12 @@ void axpro_audio_wait_fence(void* context_audio_data, void* client_buffer)
         if(!(mc->flags & AXPMCF_NONBLOCK))
         {
             // wait on reading to complete before letting client write into (this) buffer again
-            AXPro_Wait(mc, 0, 
-                if(mc->msg.ctl.request == AXPMCTL_CLREAD_FENCEREACH) 
+            AXPro_Wait(mc, 0,
+                if(mc->msg.ctl.request == AXPMCTL_CLREAD_FENCEREACH)
                 {   mc->free_streamblocks = (uint16_t) mc->msg.ctl.ctlgeneral[0];
                     goto fence_reached;
                 }
-                else if(mc->msg.ctl.request == AXPMCTL_PING) 
+                else if(mc->msg.ctl.request == AXPMCTL_PING)
                     mc->free_streamblocks = (uint16_t) mc->msg.ctl.ctlgeneral[0];
                 ,
                 break);
@@ -456,5 +465,5 @@ void axpro_audio_set_thread_callback(AXPRO_GEN_CALLBACK* SampleGenCallback, void
     if(gm.mc && gm.mc->qmain2audio)
     AXPro_RunMsg(gm.mc->qmain2audio, gm.msg_setcallback);
 
-    audio_axpro.write =  (ssize_t (*) (void*, const void*, size_t)) (SampleGenCallback ? axpro_audio_write_empty : axpro_audio_write);
+    axpro_audio_set_writer(SampleGenCallback ? axpro_audio_write_empty : axpro_audio_write);
 }
