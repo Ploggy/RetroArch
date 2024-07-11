@@ -288,7 +288,7 @@ static void wiiu_hid_polling_thread_cleanup(OSThread *thread, void *stack)
 
 static OSThread *wiiu_hid_new_thread(void)
 {
-   OSThread *t = wiiu_hid_alloc_zeroed(8, sizeof(OSThread));
+   OSThread *t = wiiu_hid_alloc_zeroed(32, sizeof(OSThread));
 
    if (!t)
       return NULL;
@@ -405,12 +405,14 @@ static wiiu_attach_event *wiiu_hid_synchronized_get_events_list(void)
 static int wiiu_hid_polling_thread(int argc, const char **argv)
 {
    wiiu_hid_t *hid = (wiiu_hid_t *)argv;
+   //uint32_t sleep_ticks = OSMicrosecondsToTicks(500); // up to max 2000 times per second
+   uint32_t sleep_ticks = OSMillisecondsToTicks(4);      // up to max 250 times per second
 
    while (!hid->polling_thread_quit)
    {
       wiiu_handle_attach_events(hid, wiiu_hid_synchronized_get_events_list());
       wiiu_poll_adapters(hid);
-      OSSleepTicks(OSMicrosecondsToTicks(500));
+      OSSleepTicks(sleep_ticks);
    }
 
    return 0;
@@ -420,9 +422,9 @@ static void wiiu_hid_start_polling_thread(wiiu_hid_t *hid)
 {
    OSThreadAttributes attributes = OS_THREAD_ATTRIB_AFFINITY_CPU2;
    int32_t stack_size            = 0x8000;
-   int32_t priority              = 10;
+   int32_t priority              = 16;
    OSThread *thread              = wiiu_hid_new_thread();
-   void *stack                   = wiiu_hid_alloc_zeroed(16, stack_size);
+   void *stack                   = wiiu_hid_alloc_zeroed(64, stack_size);
 
    RARCH_LOG("[hid]: starting polling thread.\n");
 
@@ -543,7 +545,7 @@ static wiiu_attach_event *wiiu_hid_new_attach_event(HIDDevice *device)
    /* Ignore mice and keyboards as HID devices */
    if (device->protocol > 0)
       return NULL;
-   if (!(event = wiiu_hid_alloc_zeroed(4, sizeof(wiiu_attach_event))))
+   if (!(event = wiiu_hid_alloc_zeroed(32, sizeof(wiiu_attach_event))))
       return NULL;
 
    event->handle             = device->handle;
@@ -588,7 +590,7 @@ static int32_t wiiu_attach_callback(HIDClient *client,
 
 static void *wiiu_hid_init(void)
 {
-   wiiu_hid_t *hid   = wiiu_hid_alloc_zeroed(4, sizeof(wiiu_hid_t));
+   wiiu_hid_t *hid   = wiiu_hid_alloc_zeroed(32, sizeof(wiiu_hid_t));
    HIDClient *client = wiiu_hid_alloc_zeroed(32, sizeof(HIDClient));
 
    if (!hid || !client)

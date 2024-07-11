@@ -71,6 +71,11 @@
 #include <mach/mach.h>
 #endif
 
+#if defined(HW_WUP)
+#include <coreinit/thread.h>
+#include "pthread_wiiu.h"
+#endif
+
 struct thread_data
 {
    void (*func)(void*);
@@ -158,7 +163,7 @@ sthread_t *sthread_create(void (*thread_func)(void*), void *userdata)
 }
 
 /* TODO/FIXME - this needs to be implemented for Switch/3DS */
-#if !defined(SWITCH) && !defined(USE_WIN32_THREADS) && !defined(_3DS) && !defined(GEKKO) && !defined(__HAIKU__) && !defined(EMSCRIPTEN)
+#if !defined(SWITCH) && !defined(USE_WIN32_THREADS) && !defined(_3DS) && !defined(HW_RVL) && !defined(__HAIKU__) && !defined(EMSCRIPTEN)
 #define HAVE_THREAD_ATTR
 #endif
 
@@ -193,14 +198,38 @@ sthread_t *sthread_create_with_priority(void (*thread_func)(void*), void *userda
 #ifdef HAVE_THREAD_ATTR
    pthread_attr_init(&thread_attr);
 
+   // dirty trick for WiiU
+   // let every created thread run on either cpu0 or cpu2
+   // making them run on any by default currently exibits some deadlocks
+   #ifdef HW_WUP
+   {   static cpu_set_t wiiu_cpuset;
+       if(CPU_ISSET(0, &wiiu_cpuset))
+       {   CPU_ZERO(&wiiu_cpuset);
+           CPU_SET(2, &wiiu_cpuset);
+       }
+       else
+       {   CPU_ZERO(&wiiu_cpuset);
+           CPU_SET(0, &wiiu_cpuset);
+       }
+       pthread_attr_setaffinity_np(&thread_attr, sizeof(cpu_set_t), &wiiu_cpuset);
+       thread_attr_needed = true;
+   }
+   #endif
+
    if ((thread_priority >= 1) && (thread_priority <= 100))
    {
       struct sched_param sp;
       memset(&sp, 0, sizeof(struct sched_param));
+      // sched_get_priority_min/sched_get_priority_max could be used for more portable code
+      // it will probably still need a hard coded path for systems not correctly exposing those
+      #ifndef HW_WUP
       sp.sched_priority = thread_priority;
       pthread_attr_setschedpolicy(&thread_attr, SCHED_RR);
+      #else
+      sp.sched_priority = (int) ((float) (thread_priority - 1) * 0.32f); // it should be in range [0..31] for WiiU
+      #endif
       pthread_attr_setschedparam(&thread_attr, &sp);
-
+      pthread_attr_setinheritsched(&thread_attr, PTHREAD_EXPLICIT_SCHED);
       thread_attr_needed = true;
    }
 
@@ -674,6 +703,8 @@ void scond_signal(scond_t *cond)
 #endif
 }
 
+#ifndef HW_WUP
+
 bool scond_wait_timeout(scond_t *cond, slock_t *lock, int64_t timeout_us)
 {
 #ifdef USE_WIN32_THREADS
@@ -749,6 +780,25 @@ bool scond_wait_timeout(scond_t *cond, slock_t *lock, int64_t timeout_us)
    return (pthread_cond_timedwait(&cond->cond, &lock->lock, &now) == 0);
 #endif
 }
+
+#else
+
+// On WiiU there is no timed wait for condition variable.
+// We will just sleep with mutex unlocked for the given timeout.
+// It will be the most incorrect for tasks requesting execution in the future
+// as no potential new tasks will get processed while sleeping.
+// Other than that this function seems to be pretty much used as a sleep and this implementation is correct.
+bool scond_wait_timeout(scond_t *cond, slock_t *lock, int64_t timeout_us)
+{
+    slock_unlock(lock);
+    OSSleepTicks(OSMicrosecondsToTicks(timeout_us));
+    slock_lock(lock);
+    return true;
+}
+
+#endif // HW_WUP
+
+
 
 #ifdef HAVE_THREAD_STORAGE
 bool sthread_tls_create(sthread_tls_t *tls)

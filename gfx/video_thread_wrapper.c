@@ -18,6 +18,7 @@
 #include <string.h>
 #include <limits.h>
 #include <math.h>
+#include <malloc.h>
 
 #include <compat/strl.h>
 #include <features/features_cpu.h>
@@ -702,13 +703,15 @@ static bool video_thread_init(thread_video_t *thr,
 
 #ifdef _3DS
       thr->frame.buffer      = linearMemAlign(max_size, 0x80);
+#elif HW_WUP
+      thr->frame.buffer      = (uint8_t*)memalign(0x80, max_size);
 #else
       thr->frame.buffer      = (uint8_t*)malloc(max_size);
 #endif
       if (!thr->frame.buffer)
          return false;
 
-      memset(thr->frame.buffer, 0x80, max_size);
+      memset(thr->frame.buffer, 0, max_size);
    }
 
    thr->input                = input;

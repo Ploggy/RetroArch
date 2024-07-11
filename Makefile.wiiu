@@ -8,6 +8,7 @@ WHOLE_ARCHIVE_LINK         = 0
 WIIU_HID                   = 1
 HAVE_HID                   = 1
 HAVE_RUNAHEAD              = 1
+HAVE_THREADS               = 1
 WIIU_LOG_RPX               = 0
 BUILD_DIR                  = objs/wiiu
 PC_DEVELOPMENT_TCP_PORT    ?=
@@ -39,9 +40,10 @@ OBJ += wiiu/system/memory.o
 OBJ += wiiu/system/atomic.o
 OBJ += wiiu/system/exception_handler.o
 OBJ += wiiu/system/missing_libc_functions.o
+OBJ += wiiu/pthread_wiiu.o
 
 ifeq ($(SALAMANDER_BUILD),1)
-   DEFINES += -DRARCH_CONSOLE -DIS_SALAMANDER -DHAVE_LIBMOCHA
+   DEFINES += -DRARCH_CONSOLE -DIS_SALAMANDER
 
    INCDIRS += -Ideps/libmocha/include
 
@@ -79,6 +81,7 @@ else
    DEFINES += -DHAVE_FILTERS_BUILTIN
    DEFINES += -DHAVE_SLANG
    DEFINES += -DHAVE_SHADERPIPELINE
+   DEFINES += -D_POSIX_THREADS -D_POSIX_THREAD_PRIORITY_SCHEDULING
 
 ifeq ($(HAVE_RUNAHEAD),1)
    DEFINES += -DHAVE_RUNAHEAD
@@ -216,7 +219,7 @@ ASFLAGS := $(CFLAGS) -mregnames
 # Linking/library flags
 
 LIBDIRS := -L.
-LDFLAGS := $(CFLAGS) -T$(DEVKITPRO)/wums/share/libmappedmemory.ld
+LDFLAGS := $(CFLAGS)
 
 ifeq ($(WHOLE_ARCHIVE_LINK), 1)
    WHOLE_START := -Wl,--whole-archive
@@ -268,14 +271,18 @@ NM      := $(PREFIX)nm
 LD      := $(CXX)
 
 WUT_ROOT ?= $(DEVKITPRO)/wut
-WUMS_ROOT ?= $(DEVKITPRO)/wums
+WUMS_ROOT := $(DEVKITPRO)/wums
 
 RPXSPECS := -specs=$(WUT_ROOT)/share/wut.specs
 RPLSPECS := -specs=$(WUT_ROOT)/share/wut.specs -specs=$(WUT_ROOT)/share/rpl.specs
 
-INCDIRS += -I$(WUT_ROOT)/include -I$(WUMS_ROOT)/include
-LIBDIRS += -L$(WUT_ROOT)/lib -L$(WUMS_ROOT)/lib
-LIBS += -lwut -lmappedmemory
+INCDIRS += -I$(WUT_ROOT)/include
+LIBDIRS += -L$(WUT_ROOT)/lib
+LIBDIRS += -L$(WUMS_ROOT)/lib
+
+LIBS += -lwut
+LIBS += -lmappedmemory
+LDFLAGS += -T$(WUMS_ROOT)/share/libmappedmemory.ld
 
 #-----------------------------
 # Targets and build rules

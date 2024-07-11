@@ -972,7 +972,8 @@ static int menu_cbs_init_bind_start_compare_type(menu_file_list_cbs_t *cbs,
             break;
          case MENU_SETTING_ACTION_SAVESTATE:
          case MENU_SETTING_ACTION_LOADSTATE:
-            BIND_ACTION_START(cbs, action_start_state_slot);
+            // a check for start+select usage to skip this would be nice for wiiu
+            //BIND_ACTION_START(cbs, action_start_state_slot);
             break;
          case MENU_SETTING_ACTION_PLAYREPLAY:
          case MENU_SETTING_ACTION_RECORDREPLAY:
