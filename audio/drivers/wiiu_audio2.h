@@ -20,6 +20,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
+#include <malloc.h>
 
 
 // build system specifics
@@ -36,8 +37,8 @@
 #include <sndcore2/voice.h>
 
 // wut specific common wrappers
-#define AXPro_MemAlloc(Size, Align)     MEMAllocFromDefaultHeapEx(Size, Align)
-#define AXPro_MemFree(Ptr)              MEMFreeToDefaultHeap(Ptr)
+#define AXPro_MemAlloc(Size, Align)     memalign(Align, Size)
+#define AXPro_MemFree(Ptr)              free(Ptr)
 
 #else
 // build without WUT (RetroArch build was using devkitPPC r29)
@@ -115,9 +116,9 @@ extern void LCStoreDMABlocks(void* destMem, const void* srcLC, uint32_t cache_li
 // very simple rate control
 // can help smooth out underruns and maintain continuous playback when input is tiny bit slower than output
 #define AXPRO_RATE_CONTROL_AMORTIZER    1
-#define AXPRO_RATE_LOW                  100.0f  // Hz lower than requested rate
-#define AXPRO_RATE_LOWER                200.0f  // Hz lower than requested rate
-#define AXPRO_RATE_DURATION_NORMAL      0.5f    // seconds at least in normal rate state
+#define AXPRO_RATE_LOW                  200.0f  // Hz lower than requested rate
+#define AXPRO_RATE_LOWER                600.0f  // Hz lower than requested rate
+#define AXPRO_RATE_DURATION_NORMAL      0.028f  // seconds at least in normal rate state
 #define AXPRO_RATE_DURATION_LOW         0.05f   // seconds at least in lower rate states
 
 
