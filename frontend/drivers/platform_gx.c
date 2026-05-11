@@ -204,8 +204,8 @@ static void frontend_gx_get_env(int *argc, char *argv[],
       }
    }
 #ifdef HW_RVL
-   else if (*argc > 2 &&
-         !string_is_empty(argv[1]) && !string_is_empty(argv[2]))
+   else if (*argc > 2
+         && (argv[1] && *argv[1]) && (argv[2] && *argv[2]))
    {
 #ifdef HAVE_NETWORKING
       /* If the process was forked for netplay purposes,
@@ -252,8 +252,8 @@ static void frontend_gx_get_env(int *argc, char *argv[],
    }
 #endif
 #else
-   if (*argc > 2 && argv &&
-         !string_is_empty(argv[1]) && !string_is_empty(argv[2]))
+   if (*argc > 2 && argv
+         && (argv[1] && *argv[1]) && (argv[2] && *argv[2]))
       fill_pathname_join(gx_rom_path, argv[1], argv[2], sizeof(gx_rom_path));
    else
       *gx_rom_path = '\0';
@@ -409,7 +409,7 @@ static void frontend_gx_exitspawn(char *s, size_t len, char *args)
 {
    bool should_load_game = false;
 #if defined(IS_SALAMANDER)
-   if (!string_is_empty(gx_rom_path))
+   if (gx_rom_path && *gx_rom_path)
       should_load_game = true;
 #elif defined(HW_RVL)
    char salamander_basename[NAME_MAX_LENGTH];
@@ -501,15 +501,6 @@ static bool frontend_gx_set_fork(enum frontend_fork fork_mode)
 }
 #endif
 
-static int frontend_gx_get_rating(void)
-{
-#ifdef HW_RVL
-   return 8;
-#else
-   return 6;
-#endif
-}
-
 static enum frontend_architecture frontend_gx_get_arch(void)
 {
    return FRONTEND_ARCH_PPC;
@@ -589,7 +580,6 @@ frontend_ctx_driver_t frontend_ctx_gx = {
    frontend_gx_shutdown,            /* shutdown */
    NULL,                            /* get_name */
    NULL,                            /* get_os */
-   frontend_gx_get_rating,          /* get_rating */
    NULL,                            /* load_content */
    frontend_gx_get_arch,            /* get_architecture */
    NULL,                            /* get_powerstate */
@@ -612,6 +602,7 @@ frontend_ctx_driver_t frontend_ctx_gx = {
    NULL,                            /* is_narrator_running */
    NULL,                            /* accessibility_speak */
    NULL,                            /* set_gamemode        */
+   NULL, /* get_display_type */
    "gx",                            /* ident               */
    NULL                             /* get_video_driver    */
 };

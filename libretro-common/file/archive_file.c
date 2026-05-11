@@ -358,7 +358,8 @@ bool file_archive_extract_file(
          && userdata.found_file
       )
    {
-      if (!string_is_empty(userdata.first_extracted_file_path))
+      if (    userdata.first_extracted_file_path 
+          && *userdata.first_extracted_file_path)
          strlcpy(s, userdata.first_extracted_file_path, len);
       return true;
    }
@@ -462,40 +463,6 @@ bool file_archive_perform_mode(const char *path, const char *valid_exts,
 
    return true;
 }
-
-/**
- * string_list_append_n:
- * @list             : pointer to string list
- * @elem             : element to add to the string list
- * @length           : read at most this many bytes from elem
- * @attr             : attributes of new element.
- *
- * Appends a new element to the string list.
- *
- * @return true if successful, otherwise false.
- **/
-static bool string_list_append_n(struct string_list *list,
-      const char *elem, unsigned length,
-      union string_list_elem_attr attr)
-{
-   char *data_dup = NULL;
-
-   if (list->size >= list->cap &&
-         !string_list_capacity(list, list->cap * 2))
-      return false;
-
-   if (!(data_dup = (char*)malloc(length + 1)))
-      return false;
-
-   strlcpy(data_dup, elem, length + 1);
-
-   list->elems[list->size].data = data_dup;
-   list->elems[list->size].attr = attr;
-
-   list->size++;
-   return true;
-}
-
 
 /**
  * file_archive_filename_split:
@@ -615,9 +582,18 @@ const struct file_archive_file_backend *file_archive_get_7z_file_backend(void)
 #endif
 }
 
+const struct file_archive_file_backend *file_archive_get_zstd_file_backend(void)
+{
+#ifdef HAVE_ZSTD
+   return &zstd_backend;
+#else
+   return NULL;
+#endif
+}
+
 const struct file_archive_file_backend* file_archive_get_file_backend(const char *path)
 {
-#if defined(HAVE_7ZIP) || defined(HAVE_ZLIB)
+#if defined(HAVE_7ZIP) || defined(HAVE_ZLIB) || defined(HAVE_ZSTD)
    char newpath[PATH_MAX_LENGTH];
    const char *file_ext          = NULL;
    char *last                    = NULL;
@@ -640,6 +616,11 @@ const struct file_archive_file_backend* file_archive_get_file_backend(const char
       )
       return &zlib_backend;
 #endif
+
+#ifdef HAVE_ZSTD
+   if (string_is_equal_noncase(file_ext, "zst"))
+      return &zstd_backend;
+#endif
 #endif
 
    return NULL;
@@ -654,6 +635,21 @@ const struct file_archive_file_backend* file_archive_get_file_backend(const char
  * file found inside is used.
  **/
 uint32_t file_archive_get_file_crc32(const char *path)
+{
+   uint64_t file_size;
+   return file_archive_get_file_crc32_and_size(path, &file_size);
+}
+
+/**
+ * file_archive_get_file_crc32_and_size:
+ * @path                         : filename path of archive
+ * @size                         : size of the file inside the archive
+ *
+ * Returns: CRC32 of the specified file in the archive, otherwise 0.
+ * If no path within the archive is specified, the first
+ * file found inside is used.
+ **/
+uint32_t file_archive_get_file_crc32_and_size(const char *path, uint64_t *size)
 {
    file_archive_transfer_t state;
    struct archive_extract_userdata userdata        = {0};
@@ -713,6 +709,6 @@ uint32_t file_archive_get_file_crc32(const char *path)
    }
 
    file_archive_parse_file_iterate_stop(&state);
-
+   *size = userdata.size;
    return userdata.crc;
 }

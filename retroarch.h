@@ -71,6 +71,11 @@
                                             * 3 - Late
                                             */
 
+#define RETRO_ENVIRONMENT_SET_SAVE_STATE_DISABLE_UNDO (5 | RETRO_ENVIRONMENT_RETROARCH_START_BLOCK)
+                                            /* bool * --
+                                            * If true, disables the save state save/load undo feature to conserve memory.
+                                            */
+
 #define DRIVERS_CMD_ALL \
       ( DRIVER_AUDIO_MASK \
       | DRIVER_MICROPHONE_MASK \
@@ -209,7 +214,7 @@ void retroarch_fail(int error_code, const char *error);
 
 bool should_quit_on_close(void);
 
-uint16_t retroarch_get_flags(void);
+uint32_t retroarch_get_flags(void);
 
 RETRO_END_DECLS
 

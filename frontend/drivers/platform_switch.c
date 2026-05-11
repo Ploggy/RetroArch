@@ -298,7 +298,7 @@ static void frontend_switch_get_env(
    for (i = 0; i < DEFAULT_DIR_LAST; i++)
    {
       const char *dir_path = g_defaults.dirs[i];
-      if (!string_is_empty(dir_path))
+      if (dir_path && *dir_path)
          path_mkdir(dir_path);
    }
 
@@ -347,7 +347,7 @@ static void frontend_switch_deinit(void *data)
 #ifdef HAVE_LIBNX
 static void frontend_switch_exec(const char *path, bool should_load_game)
 {
-   if (!string_is_empty(path))
+   if (path && *path)
    {
       char args[PATH_MAX];
 
@@ -372,7 +372,7 @@ static void frontend_switch_exec(const char *path, bool should_load_game)
          }
          else
 #endif
-         if (!string_is_empty(content))
+         if (content && *content)
             snprintf(args, sizeof(args), "%s \"%s\"", path, content);
       }
 #else
@@ -382,10 +382,8 @@ static void frontend_switch_exec(const char *path, bool should_load_game)
          if (stat(path, &sbuff))
          {
             char core_path[PATH_MAX];
-
             get_first_valid_core(core_path, sizeof(core_path));
-
-            if (string_is_empty(core_path))
+            if (!core_path || !*core_path)
                svcExitProcess();
          }
       }
@@ -486,7 +484,7 @@ char *realpath(const char *name, char *resolved)
 
    if (!resolved)
    {
-      rpath = malloc(path_max);
+      rpath = (char*)malloc(path_max);
       if (!rpath)
          return NULL;
    }
@@ -624,11 +622,6 @@ static void frontend_switch_init(void *data)
    else
        RARCH_WARN("Error initializing psm.\n");
 #endif /* HAVE_LIBNX (splash) */
-}
-
-static int frontend_switch_get_rating(void)
-{
-   return 11;
 }
 
 enum frontend_architecture frontend_switch_get_arch(void)
@@ -792,7 +785,6 @@ frontend_ctx_driver_t frontend_ctx_switch =
    frontend_switch_shutdown,
    frontend_switch_get_name,
    frontend_switch_get_os,
-   frontend_switch_get_rating,
    NULL,                               /* content_loaded */
    frontend_switch_get_arch,           /* get_architecture       */
    frontend_switch_get_powerstate,     /* get_powerstate         */
@@ -815,6 +807,7 @@ frontend_ctx_driver_t frontend_ctx_switch =
    NULL,                               /* is_narrator_running */
    NULL,                               /* accessibility_speak */
    NULL,                               /* set_gamemode */
+   NULL, /* get_display_type */
    "switch",                           /* ident */
    NULL                                /* get_video_driver */
 };

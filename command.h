@@ -149,6 +149,14 @@ enum event_command
    CMD_EVENT_VIDEO_SET_ASPECT_RATIO,
    /* Restarts RetroArch. */
    CMD_EVENT_RESTART_RETROARCH,
+#ifdef HAVE_CLOUDSYNC
+   /* Trigger cloud sync */
+   CMD_EVENT_CLOUD_SYNC,
+   /* Resolve cloud sync conflicts by keeping local files */
+   CMD_EVENT_CLOUD_SYNC_RESOLVE_KEEP_LOCAL,
+   /* Resolve cloud sync conflicts by keeping server files */
+   CMD_EVENT_CLOUD_SYNC_RESOLVE_KEEP_SERVER,
+#endif
    /* Shutdown the OS */
    CMD_EVENT_SHUTDOWN,
    /* Reboot the OS */
@@ -343,7 +351,7 @@ bool command_network_send(const char *cmd_);
 #ifdef HAVE_STDIN_CMD
 command_t* command_stdin_new(void);
 #endif
-#ifdef LAKKA
+#ifdef HAVE_LAKKA
 command_t* command_uds_new(void);
 #endif
 #ifdef EMSCRIPTEN
@@ -423,6 +431,7 @@ bool command_get_status(command_t *cmd, const char* arg);
 bool command_get_config_param(command_t *cmd, const char* arg);
 bool command_show_osd_msg(command_t *cmd, const char* arg);
 bool command_load_state_slot(command_t *cmd, const char* arg);
+bool command_save_state_slot(command_t* cmd, const char* arg);
 bool command_play_replay_slot(command_t *cmd, const char* arg);
 bool command_seek_replay(command_t *cmd, const char *arg);
 bool command_save_savefiles(command_t *cmd, const char* arg);
@@ -453,6 +462,7 @@ static const struct cmd_action_map action_map[] = {
    { "WRITE_CORE_MEMORY",command_write_memory,     "<address> <byte1> <byte2> ..." },
 
    { "LOAD_STATE_SLOT",command_load_state_slot, "<slot number>"},
+   { "SAVE_STATE_SLOT",command_save_state_slot, "<slot number>"},
    { "PLAY_REPLAY_SLOT",command_play_replay_slot, "<slot number>"},
    { "SEEK_REPLAY",command_seek_replay, "<frame number>"},
 

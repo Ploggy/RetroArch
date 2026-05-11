@@ -41,7 +41,7 @@ int msg_hash_get_help_us_enum(enum msg_hash_enums msg, char *s, size_t len)
              strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_HELP_ENABLE_HOTKEY), len);
              break;
           default:
-             if (string_is_empty(s))
+             if (!s || !*s)
                 strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_NO_INFORMATION_AVAILABLE), len);
              break;
        }
@@ -84,9 +84,6 @@ int msg_hash_get_help_us_enum(enum msg_hash_enums msg, char *s, size_t len)
              break;
           case MENU_ENUM_LABEL_DUMMY_ON_CORE_SHUTDOWN:
              strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_HELP_DUMMY_ON_CORE_SHUTDOWN), len);
-             break;
-          case MENU_ENUM_LABEL_CHECK_FOR_MISSING_FIRMWARE:
-             strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_HELP_CHECK_FOR_MISSING_FIRMWARE), len);
              break;
           case MENU_ENUM_LABEL_CORE_INFO_SAVESTATE_BYPASS:
              strlcpy(s, msg_hash_to_str(MENU_ENUM_SUBLABEL_CORE_INFO_SAVESTATE_BYPASS), len);
@@ -510,7 +507,7 @@ int msg_hash_get_help_us_enum(enum msg_hash_enums msg, char *s, size_t len)
              }
              break;
           default:
-             if (string_is_empty(s))
+             if (!s || !*s)
                 strlcpy(s, msg_hash_to_str(MENU_ENUM_LABEL_VALUE_NO_INFORMATION_AVAILABLE), len);
              return -1;
        }
