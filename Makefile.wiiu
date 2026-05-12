@@ -245,6 +245,9 @@ CFLAGS := $(FLAGS) -Werror=implicit-function-declaration
 CFLAGS += -std=gnu89 -Wno-scalar-storage-order
 # wut's 'gx2/shaders.h' isn't c89-compliant
 $(BUILD_DIR)/wiiu/shader_utils.o: CFLAGS += -std=c99
+# These video filter files use C99 for-loop declarations
+$(BUILD_DIR)/gfx/video_filters/crop_borders.o: CFLAGS += -std=gnu99
+$(BUILD_DIR)/gfx/video_filters/ntsc.o: CFLAGS += -std=gnu99
 
 CXXFLAGS := $(FLAGS)
 

@@ -295,14 +295,8 @@ void test_os_exceptions(void)
 
    /*Malformed instruction, causes PROG. Doesn't seem to work. */
    __asm__ volatile (
-<<<<<<< HEAD
       ".int 0xDEADC0DE"
    );
-#endif
-=======
-         ".int 0xDEADC0DE"
-         );
->>>>>>> upstream/master
 
    /* Jump to 0; causes ISI */
    void (*testFunc)() = (void(*)())0;

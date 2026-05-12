@@ -133,6 +133,7 @@ typedef struct
    void *output_ring_buffer;
    u32 input_ring_buffer_size;
    u32 output_ring_buffer_size;
+   void *texture_data;
 
    int width;
    int height;

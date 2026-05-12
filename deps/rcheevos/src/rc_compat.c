@@ -220,6 +220,29 @@ void rc_mutex_unlock(rc_mutex_t* mutex)
   RecursiveLock_Unlock(mutex);
 }
 
+#elif defined(__wiiu__)
+
+void rc_mutex_init(rc_mutex_t* mutex)
+{
+  /* WiiU pthread mutexes are always recursive, no need for mutexattr */
+  pthread_mutex_init(mutex, NULL);
+}
+
+void rc_mutex_destroy(rc_mutex_t* mutex)
+{
+  pthread_mutex_destroy(mutex);
+}
+
+void rc_mutex_lock(rc_mutex_t* mutex)
+{
+  pthread_mutex_lock(mutex);
+}
+
+void rc_mutex_unlock(rc_mutex_t* mutex)
+{
+  pthread_mutex_unlock(mutex);
+}
+
 #else
 
 void rc_mutex_init(rc_mutex_t* mutex)

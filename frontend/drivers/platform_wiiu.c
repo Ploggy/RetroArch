@@ -389,7 +389,6 @@ frontend_ctx_driver_t frontend_ctx_wiiu =
    frontend_wiiu_shutdown,
    NULL,                         /* get_name */
    NULL,                         /* get_os */
-   frontend_wiiu_get_rating,
    NULL,                         /* content_loaded */
    frontend_wiiu_get_arch,       /* get_architecture */
    NULL,                         /* get_powerstate */

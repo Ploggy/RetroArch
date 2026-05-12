@@ -248,7 +248,7 @@ static void kpad_poll(void)
 
       /* Several reads when a device is connected or an attachment added give */
       /* bogus results, try to weed them out */
-      if (kpad.error || kpad.extensionType == WPAD_EXT_UNKNOWN)
+      if (kpad.error)
          continue;
 
       kpad_poll_one_channel(channel, &kpad);
@@ -274,7 +274,6 @@ static const char *kpad_name(unsigned pad)
       case WPAD_EXT_MPLUS:
       case WPAD_EXT_CORE:
          return PAD_NAME_WIIMOTE;
-      case WPAD_EXT_DEV_NOT_FOUND:
       default:
 #ifdef DEBUG
          RARCH_LOG("[kpad] Unknown pad type %d\n", joypad_state.kpad.wiimotes[pad].type);
