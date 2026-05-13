@@ -18,7 +18,11 @@
 #include <string.h>
 #include <limits.h>
 #include <math.h>
+#if defined(HW_WUP)
 #include <malloc.h>
+#else
+#include <stdlib.h>
+#endif
 
 #include <compat/strl.h>
 #include <features/features_cpu.h>
