@@ -25,8 +25,6 @@
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 199309
 #endif
-#endif
-#endif
 
 #include <stdlib.h>
 #include <string.h>
@@ -231,7 +229,6 @@ sthread_t *sthread_create_with_priority(void (*thread_func)(void*), void *userda
       pthread_attr_setschedparam(&thread_attr, &sp);
 #if !defined(ANDROID) && !defined(HW_WUP)
       pthread_attr_setinheritsched(&thread_attr, PTHREAD_EXPLICIT_SCHED);
-#endif
 #endif
       thread_attr_needed = true;
    }
