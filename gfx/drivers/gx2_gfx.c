@@ -20,6 +20,7 @@
 #include <math.h>
 
 #include <coreinit/time.h>
+#include <coreinit/core.h>
 
 #include <gx2/enum.h>
 #include <gx2/ra_shaders.h>
@@ -247,7 +248,8 @@ static bool gx2_set_shader(void *data,
    if (!wiiu)
       return false;
 
-   GX2DrawDone();
+   if (ProcUIInForeground())
+      GX2DrawDone();
    if (wiiu->shader_preset)
       gx2_free_shader_preset(wiiu);
 
@@ -722,8 +724,10 @@ static void gx2_font_free(void* data, bool is_threaded)
       font->font_driver->free(font->font_data);
 
    /* Ensure the GPU has finished any draws referencing the
-    * font atlas and UBO before freeing the backing memory. */
-   GX2DrawDone();
+    * font atlas and UBO before freeing the backing memory.
+    * Skip when threaded to avoid deadlocking the video thread. */
+   if (!is_threaded)
+      GX2DrawDone();
 
    if (font->texture.surface.image)
       MEM1_free(font->texture.surface.image);
@@ -1599,8 +1603,10 @@ static void gx2_free(void *data)
 
       GX2SwapScanBuffers();
       GX2Flush();
-      GX2DrawDone();
-      GX2WaitForVsync();
+      if (OSGetCoreId() == GX2GetMainCoreId())
+         GX2DrawDone();
+      if (OSGetCoreId() == GX2GetMainCoreId())
+         GX2WaitForVsync();
 
       GX2SetTVEnable(GX2_DISABLE);
       GX2SetDRCEnable(GX2_DISABLE);
@@ -2049,6 +2055,7 @@ static bool gx2_frame(void *data, const void *frame,
 
       if (wiiu->last_vsync >= last_vsync)
       {
+         if (OSGetCoreId() == GX2GetMainCoreId())
          GX2WaitForVsync();
          wiiu->last_vsync = last_vsync + OSMillisecondsToTicks(17);
       }
@@ -2501,14 +2508,13 @@ static void gx2_unload_texture(void *data,
       bool threaded, uintptr_t handle)
 {
    GX2Texture *texture = (GX2Texture *)handle;
-
    if (!texture)
       return;
-
    /* Ensure the GPU has finished any draws referencing this
-    * texture before freeing the backing memory. */
-   GX2DrawDone();
-
+    * texture before freeing the backing memory.
+    * Skip when threaded to avoid deadlocking the video thread. */
+   if (!threaded)
+      GX2DrawDone();
    MEM2_free(texture->surface.image);
    free(texture);
 }
