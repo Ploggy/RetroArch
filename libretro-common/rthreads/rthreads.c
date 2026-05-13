@@ -229,7 +229,10 @@ sthread_t *sthread_create_with_priority(void (*thread_func)(void*), void *userda
       sp.sched_priority = (int) ((float) (thread_priority - 1) * 0.32f); // it should be in range [0..31] for WiiU
       #endif
       pthread_attr_setschedparam(&thread_attr, &sp);
+#if !defined(ANDROID) && !defined(HW_WUP)
       pthread_attr_setinheritsched(&thread_attr, PTHREAD_EXPLICIT_SCHED);
+#endif
+#endif
       thread_attr_needed = true;
    }
 
